@@ -19,15 +19,19 @@ Key Features:
    with their own field metadata and ranges.
 4. **Offset Tracking**: Records exact byte offsets for field headers and values 
    within the Thrift metadata blob.
-5. **Debug Mode**: Optional debug output showing field processing details.
+5. **List Header Analysis**: For list fields, there may be a gap between field_header_range 
+   and value_range. This gap contains the Thrift list metadata (element type and count) 
+   as specified by the Thrift binary protocol. Use --show-list-headers to visualize this.
+6. **Debug Mode**: Optional debug output showing field processing details.
 
 Usage:
-    python parquet_lens.py <parquet_file> [--debug]
+    python parquet_lens.py <parquet_file> [--debug] [--show-list-headers]
 
 The output includes:
 - File structure overview (magic numbers, data blocks, metadata blob)
 - Detailed FileMetaData field analysis with byte-level precision
 - Nested field ranges for complex structures like RowGroup, ColumnChunk, etc.
+- Optional list header ranges showing Thrift protocol internals
 """
 
 import argparse
@@ -231,6 +235,8 @@ class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
 
     def readListBegin(self):
         # Save current field context for list processing
+        # Note: There will be a gap between field_header_range and value_range for lists.
+        # This gap contains the list header (element type + element count) as per Thrift binary protocol.
         if self._current_field_name and self._current_field_id is not None:
             field_context = {
                 'field_name': self._current_field_name,
@@ -242,10 +248,24 @@ class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
             
             field_key = f"{self._struct_nesting_level}_{self._current_field_name}_{self._current_field_id}"
             if field_key in self.field_details:
+                # Record the position just before reading list metadata
+                list_header_start = self._get_trans_pos()
+                
+                # Call super() to read the list header (element type + count)
+                result = super().readListBegin()
+                
+                # Now record the position after reading list metadata (start of actual elements)
                 value_start_offset = self._get_trans_pos()
                 self.field_details[field_key]['value_start_offset'] = value_start_offset
+                
+                # Optionally record the list header range (the gap)
+                if hasattr(self, '_show_list_headers') and self._show_list_headers:
+                    self.field_details[field_key]['list_header_range'] = [list_header_start, value_start_offset]
+                
                 if hasattr(self, '_debug_enabled') and self._debug_enabled:
-                    print(f"DEBUG: LIST BEGIN - Field {self._current_field_name} (ID {self._current_field_id}) - Value start: {value_start_offset} - Key: {field_key}", file=sys.stderr)
+                    print(f"DEBUG: LIST BEGIN - Field {self._current_field_name} (ID {self._current_field_id}) - List header: [{list_header_start}, {value_start_offset}], Value start: {value_start_offset} - Key: {field_key}", file=sys.stderr)
+                
+                return result
         
         return super().readListBegin()
 
@@ -331,7 +351,20 @@ def get_thrift_type_name(field_type, type_args):
     if field_type in type_map:
         return type_map[field_type]
     elif field_type == TType.LIST:
-        if type_args and isinstance(type_args, tuple) and len(type_args) > 0:
+        if type_args and isinstance(type_args, tuple) and len(type_args) > 1:
+            # type_args format: (element_type_id, [element_class, element_spec])
+            element_type_id = type_args[0]
+            element_info = type_args[1]
+            
+            if isinstance(element_info, (list, tuple)) and len(element_info) > 0:
+                element_class = element_info[0]
+                if hasattr(element_class, '__name__'):
+                    return f"list<{element_class.__name__}>"
+            
+            # Fallback to type ID
+            return f"list<{get_thrift_type_name(element_type_id, None)}>"
+        elif type_args and isinstance(type_args, tuple) and len(type_args) > 0:
+            # Legacy format handling
             element_type = type_args[0]
             if isinstance(element_type, tuple) and len(element_type) > 0:
                 # For struct lists like list<SchemaElement>
@@ -340,6 +373,7 @@ def get_thrift_type_name(field_type, type_args):
                 else:
                     return f"list<{get_thrift_type_name(element_type, None)}>"
             else:
+                # For primitive type lists
                 return f"list<{get_thrift_type_name(element_type, None)}>"
         return "list"
     elif field_type == TType.STRUCT:
@@ -417,11 +451,63 @@ def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_fi
                     if element_is_enum and element_enum_class:
                         processed_value.append(element_enum_class._VALUES_TO_NAMES.get(item, item))
                     else:
-                        processed_value.append(thrift_to_dict_with_offsets(item, field_details_map, base_offset_in_file, nesting_level + 1, show_undefined_optional))
+                        # For struct elements in lists, create consistent structure
+                        item_data = thrift_to_dict_with_offsets(item, field_details_map, base_offset_in_file, nesting_level + 1, show_undefined_optional)
+                        
+                        if hasattr(item, '__class__') and hasattr(item, '__dict__'):
+                            # This is a struct, wrap it with consistent structure
+                            struct_info = {
+                                "thrift_type": type(item).__name__
+                            }
+                            
+                            # Add fields (converted to list format for consistency)
+                            if isinstance(item_data, list):
+                                struct_info["fields"] = item_data
+                            elif isinstance(item_data, dict):
+                                # Convert dict back to list format
+                                struct_info["fields"] = list(item_data.values())
+                            else:
+                                struct_info["fields"] = []
+                            
+                            processed_value.append(struct_info)
+                        else:
+                            # Not a struct, use as-is
+                            processed_value.append(item_data)
             elif field_value is None:
                 processed_value = None
         elif field_type == TType.STRUCT:
-            processed_value = thrift_to_dict_with_offsets(field_value, field_details_map, base_offset_in_file, nesting_level + 1, show_undefined_optional)
+            # For struct fields, create a consistent structure
+            if field_value:
+                struct_data = thrift_to_dict_with_offsets(field_value, field_details_map, base_offset_in_file, nesting_level + 1, show_undefined_optional)
+                
+                # Create consistent struct representation
+                struct_info = {
+                    "thrift_type": type(field_value).__name__ if hasattr(field_value, '__class__') else 'struct'
+                }
+                
+                # Add range information if available for this struct field
+                struct_field_key = f"{nesting_level}_{field_name}_{field_id}"
+                if struct_field_key in field_details_map:
+                    details = field_details_map[struct_field_key]
+                    if 'value_range_in_blob' in details and details['value_range_in_blob']:
+                        blob_range = details['value_range_in_blob']
+                        struct_info['value_range'] = [
+                            blob_range[0] + base_offset_in_file,
+                            blob_range[1] + base_offset_in_file
+                        ]
+                
+                # Add fields (converted to list format for consistency)
+                if isinstance(struct_data, list):
+                    struct_info["fields"] = struct_data
+                elif isinstance(struct_data, dict):
+                    # Convert dict back to list format
+                    struct_info["fields"] = list(struct_data.values())
+                else:
+                    struct_info["fields"] = []
+                
+                processed_value = struct_info
+            else:
+                processed_value = None
         elif isinstance(field_value, bytes):
             try:
                 processed_value = field_value.decode('utf-8')
@@ -481,7 +567,7 @@ def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_fi
         field_data = {
             "field_id": field_id,
             "field_name": field_name,
-            "type": get_thrift_type_name(field_type, type_args),
+            "thrift_type": get_thrift_type_name(field_type, type_args),
         }
 
         # Only show "required": true when fields are actually required
@@ -495,6 +581,13 @@ def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_fi
             if 'field_header_range_in_blob' in details and details['field_header_range_in_blob']:
                 blob_range = details['field_header_range_in_blob']
                 field_data['field_header_range'] = [
+                    blob_range[0] + base_offset_in_file,
+                    blob_range[1] + base_offset_in_file
+                ]
+            # Add list header range if available (shows the gap for lists)
+            if 'list_header_range' in details and details['list_header_range']:
+                blob_range = details['list_header_range']
+                field_data['list_header_range'] = [
                     blob_range[0] + base_offset_in_file,
                     blob_range[1] + base_offset_in_file
                 ]
@@ -580,7 +673,7 @@ def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_fi
     return result_fields
 
 
-def analyze_parquet_file(file_path, debug=False, show_undefined_optional=False):
+def analyze_parquet_file(file_path, debug=False, show_undefined_optional=False, show_list_headers=False):
     """
     Analyzes a Parquet file and returns a detailed byte-by-byte mapping.
     """
@@ -661,6 +754,8 @@ def analyze_parquet_file(file_path, debug=False, show_undefined_optional=False):
                     
                     # Enable debug output in the protocol if requested
                     protocol._debug_enabled = debug
+                    # Enable list header tracking if requested
+                    protocol._show_list_headers = show_list_headers
                     
                     file_metadata_obj = FileMetaData()
                     file_metadata_obj.read(protocol)
@@ -740,10 +835,13 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Enable debug output showing field processing details.")
     parser.add_argument("--show-undefined-optional-fields", action="store_true", 
                         help="Show optional fields even when they are undefined/null (default: hide them)")
+    parser.add_argument("--show-list-headers", action="store_true",
+                        help="Show list header ranges. For list fields, this reveals the gap between field_header_range and value_range, which contains Thrift list metadata (element type + element count) as per the Thrift binary protocol specification.")
     args = parser.parse_args()
 
     analysis_result = analyze_parquet_file(args.parquet_file, debug=args.debug, 
-                                         show_undefined_optional=args.show_undefined_optional_fields)
+                                         show_undefined_optional=args.show_undefined_optional_fields,
+                                         show_list_headers=args.show_list_headers)
     print(json.dumps(analysis_result, indent=4))
 
 if __name__ == "__main__":
