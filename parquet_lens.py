@@ -1,11 +1,43 @@
 import argparse
 import json
 import pyarrow.parquet as pq
+import sys # Add sys import
+import os # Add os import
 
-# (Further imports for Thrift might be needed if we go very low-level)
-# from thrift.protocol import TCompactProtocol
-# from thrift.transport import TTransport
-# from parquet_format.format import FileMetaData # Assuming you have parquet.thrift generated Python files
+# Imports for Thrift
+from thrift.protocol import TCompactProtocol
+from thrift.transport import TTransport
+from parquet.ttypes import FileMetaData # Updated import path
+
+def thrift_to_dict(thrift_obj):
+    """
+    Recursively converts a Thrift object to a dictionary.
+    Handles enums by converting them to their string names.
+    Handles bytes by attempting UTF-8 decode or converting to hex.
+    """
+    if hasattr(thrift_obj, '__dict__'):
+        result = {}
+        for k, v in thrift_obj.__dict__.items():
+            if hasattr(v, '_NAMES_TO_VALUES'): # Check if it's a Thrift enum
+                result[k] = thrift_obj._VALUES_TO_NAMES[v] if v in thrift_obj._VALUES_TO_NAMES else v
+            elif isinstance(v, list):
+                result[k] = [thrift_to_dict(i) for i in v]
+            elif hasattr(v, '__dict__'):
+                result[k] = thrift_to_dict(v)
+            elif isinstance(v, bytes): # Handle bytes
+                try:
+                    result[k] = v.decode('utf-8')
+                except UnicodeDecodeError:
+                    result[k] = v.hex() # Fallback to hex representation
+            else:
+                result[k] = v
+        return result
+    elif isinstance(thrift_obj, bytes): # Handle top-level bytes object, though less common for complex structs
+        try:
+            return thrift_obj.decode('utf-8')
+        except UnicodeDecodeError:
+            return thrift_obj.hex()
+    return thrift_obj
 
 def analyze_parquet_file(file_path):
     """
@@ -78,17 +110,25 @@ def analyze_parquet_file(file_path):
                 f.seek(metadata_offset)
                 metadata_bytes = f.read(footer_length)
 
-                # Here, you would parse metadata_bytes using Thrift
-                # This is a placeholder for the complex Thrift parsing logic
-                # For now, just mark it as a Thrift block
+                # Parse metadata_bytes using Thrift
+                parsed_metadata = None
+                try:
+                    transport = TTransport.TMemoryBuffer(metadata_bytes)
+                    protocol = TCompactProtocol.TCompactProtocol(transport)
+                    file_metadata_obj = FileMetaData()
+                    file_metadata_obj.read(protocol)
+                    parsed_metadata = thrift_to_dict(file_metadata_obj)
+                except Exception as e:
+                    parsed_metadata = {"error": f"Thrift deserialization failed: {str(e)}"}
+
+
                 segments.append({
                     "range": [metadata_offset, metadata_offset + footer_length],
                     "type": "thrift_metadata_blob",
-                    "thrift_type": "FileMetaData", # Tentative
-                    "description": "Raw bytes of the FileMetaData Thrift structure",
-                    "size": footer_length
-                    # In a real implementation, this would be recursively parsed
-                    # into its constituent Thrift fields with their own ranges.
+                    "thrift_type": "FileMetaData",
+                    "description": "FileMetaData Thrift structure",
+                    "size": footer_length,
+                    "parsed_value": parsed_metadata # Add the parsed structure
                 })
 
                 # Placeholder for the data part
