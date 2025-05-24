@@ -61,6 +61,9 @@ class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
         self._current_spec = self._struct_class_spec
         # Track nesting level to only record top-level fields
         self._struct_nesting_level = 0
+        
+        # Stack to track field context during complex type reading
+        self._field_context_stack = []
 
     def _get_trans_pos(self):
         # For TMemoryBuffer, the actual io.BytesIO object is typically in _buffer
@@ -82,6 +85,13 @@ class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
         )
 
     def readStructBegin(self):
+        # Record the start of struct value for non-top-level structs
+        if self._current_field_name and self._current_field_id is not None:
+            field_key = f"{self._struct_nesting_level}_{self._current_field_name}_{self._current_field_id}"
+            if field_key in self.field_details:
+                value_start_offset = self._get_trans_pos()
+                self.field_details[field_key]['value_start_offset'] = value_start_offset
+
         # For nested structs, we need to push the current spec and update to the new one.
         # This requires knowing the spec of the field we are about to read.
         # This part is tricky as readStructBegin itself doesn't know which field it belongs to.
@@ -92,6 +102,22 @@ class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
     def readStructEnd(self):
         super().readStructEnd()
         self._struct_nesting_level -= 1
+        
+        # Record the end of struct value
+        if self._current_field_name and self._current_field_id is not None:
+            field_key = f"{self._struct_nesting_level + 1}_{self._current_field_name}_{self._current_field_id}"
+            if field_key in self.field_details and 'value_start_offset' in self.field_details[field_key]:
+                value_end_offset = self._get_trans_pos()
+                value_start_offset = self.field_details[field_key]['value_start_offset']
+                self.field_details[field_key]['value_range_in_blob'] = [value_start_offset, value_end_offset]
+                # Remove the temporary start offset
+                del self.field_details[field_key]['value_start_offset']
+                
+                if self._field_total_start_offset_in_blob is not None:
+                    self.field_details[field_key]['field_total_range_in_blob'] = [
+                        self._field_total_start_offset_in_blob, value_end_offset
+                    ]
+        
         # Pop spec when exiting a struct
         if self._parent_spec_stack:
             self._current_spec = self._parent_spec_stack.pop()
@@ -203,6 +229,51 @@ class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
     def readBinary(self): return self._read_primitive('readBinary') # Added for TType.STRING when it's binary
     def readI16(self): return self._read_primitive('readI16')
 
+    def readListBegin(self):
+        # Save current field context for list processing
+        if self._current_field_name and self._current_field_id is not None:
+            field_context = {
+                'field_name': self._current_field_name,
+                'field_id': self._current_field_id,
+                'nesting_level': self._struct_nesting_level,
+                'field_total_start': self._field_total_start_offset_in_blob
+            }
+            self._field_context_stack.append(field_context)
+            
+            field_key = f"{self._struct_nesting_level}_{self._current_field_name}_{self._current_field_id}"
+            if field_key in self.field_details:
+                value_start_offset = self._get_trans_pos()
+                self.field_details[field_key]['value_start_offset'] = value_start_offset
+                if hasattr(self, '_debug_enabled') and self._debug_enabled:
+                    print(f"DEBUG: LIST BEGIN - Field {self._current_field_name} (ID {self._current_field_id}) - Value start: {value_start_offset} - Key: {field_key}", file=sys.stderr)
+        
+        return super().readListBegin()
+
+    def readListEnd(self):
+        # Restore field context for list processing
+        if self._field_context_stack:
+            field_context = self._field_context_stack.pop()
+            field_name = field_context['field_name']
+            field_id = field_context['field_id']
+            nesting_level = field_context['nesting_level']
+            field_total_start = field_context['field_total_start']
+            
+            field_key = f"{nesting_level}_{field_name}_{field_id}"
+            if field_key in self.field_details and 'value_start_offset' in self.field_details[field_key]:
+                value_end_offset = self._get_trans_pos()
+                value_start_offset = self.field_details[field_key]['value_start_offset']
+                self.field_details[field_key]['value_range_in_blob'] = [value_start_offset, value_end_offset]
+                if hasattr(self, '_debug_enabled') and self._debug_enabled:
+                    print(f"DEBUG: LIST END - Field {field_name} (ID {field_id}) - Value range: [{value_start_offset}, {value_end_offset}] - Key: {field_key}", file=sys.stderr)
+                # Remove the temporary start offset
+                del self.field_details[field_key]['value_start_offset']
+                
+                if field_total_start is not None:
+                    self.field_details[field_key]['field_total_range_in_blob'] = [
+                        field_total_start, value_end_offset
+                    ]
+        
+        super().readListEnd()
 
 def get_enum_class_for_field(field_name, struct_name):
     """
@@ -406,19 +477,18 @@ def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_fi
         if not show_undefined_optional and not required and processed_value is None:
             continue
 
+        # Build field_data in desired order: metadata first, ranges next, value last
         field_data = {
             "field_id": field_id,
             "field_name": field_name,
             "type": get_thrift_type_name(field_type, type_args),
-            "value": processed_value,
-            "original_index": index  # For sorting
         }
 
         # Only show "required": true when fields are actually required
         if required:
             field_data["required"] = True
 
-        # Add offset information for this field if available
+        # Add offset information for this field if available (before value)
         field_key = f"{nesting_level}_{field_name}_{field_id}"
         if field_key in field_details_map:
             details = field_details_map[field_key]
@@ -434,6 +504,10 @@ def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_fi
                     blob_range[0] + base_offset_in_file,
                     blob_range[1] + base_offset_in_file
                 ]
+
+        # Add value last for better readability
+        field_data["value"] = processed_value
+        field_data["original_index"] = index  # For sorting
         
         # For nested structures, recursively add offset information
         if field_type == TType.STRUCT and processed_value and isinstance(processed_value, dict):
