@@ -35,7 +35,6 @@ python parquet_lens.py <parquet_file> [options]
 - `--debug`: Enable debug mode for detailed output
 - `--show-list-headers`: Show headers for list fields
 - `--show-undefined-optional`: Show undefined optional fields
-- `--output <file>`: Write output to specified file
 
 ## Testing
 
