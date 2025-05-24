@@ -359,6 +359,7 @@ def get_thrift_type_name(field_type, type_args):
             if isinstance(element_info, (list, tuple)) and len(element_info) > 0:
                 element_class = element_info[0]
                 if hasattr(element_class, '__name__'):
+                    # Use the class name directly
                     return f"list<{element_class.__name__}>"
             
             # Fallback to type ID
