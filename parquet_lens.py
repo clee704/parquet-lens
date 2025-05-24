@@ -280,7 +280,7 @@ def get_thrift_type_name(field_type, type_args):
         return f"unknown_type_{field_type}"
 
 
-def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_file, nesting_level=1):
+def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_file, nesting_level=1, show_undefined_optional=False):
     """
     Recursively converts a Thrift object to a list or dict of field data,
     with detailed offset information and type annotations.
@@ -289,7 +289,7 @@ def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_fi
         return None
 
     if isinstance(thrift_obj, list):
-        return [thrift_to_dict_with_offsets(i, field_details_map, base_offset_in_file, nesting_level + 1) for i in thrift_obj]
+        return [thrift_to_dict_with_offsets(i, field_details_map, base_offset_in_file, nesting_level + 1, show_undefined_optional) for i in thrift_obj]
 
     if not hasattr(thrift_obj, '__dict__'): # Base types, enums
         if isinstance(thrift_obj, bytes):
@@ -307,7 +307,7 @@ def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_fi
         result = {}
         for attr_name, attr_value in thrift_obj.__dict__.items():
             if attr_name.startswith('_'): continue
-            result[attr_name] = thrift_to_dict_with_offsets(attr_value, field_details_map, base_offset_in_file, nesting_level + 1)
+            result[attr_name] = thrift_to_dict_with_offsets(attr_value, field_details_map, base_offset_in_file, nesting_level + 1, show_undefined_optional)
         return result
 
     for index, spec_tuple in enumerate(obj_thrift_spec):
@@ -346,11 +346,11 @@ def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_fi
                     if element_is_enum and element_enum_class:
                         processed_value.append(element_enum_class._VALUES_TO_NAMES.get(item, item))
                     else:
-                        processed_value.append(thrift_to_dict_with_offsets(item, field_details_map, base_offset_in_file, nesting_level + 1))
+                        processed_value.append(thrift_to_dict_with_offsets(item, field_details_map, base_offset_in_file, nesting_level + 1, show_undefined_optional))
             elif field_value is None:
                 processed_value = None
         elif field_type == TType.STRUCT:
-            processed_value = thrift_to_dict_with_offsets(field_value, field_details_map, base_offset_in_file, nesting_level + 1)
+            processed_value = thrift_to_dict_with_offsets(field_value, field_details_map, base_offset_in_file, nesting_level + 1, show_undefined_optional)
         elif isinstance(field_value, bytes):
             try:
                 processed_value = field_value.decode('utf-8')
@@ -402,14 +402,21 @@ def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_fi
             # Default heuristic: assume optional unless we know it's required
             required = False
 
+        # Skip undefined optional fields if show_undefined_optional is False
+        if not show_undefined_optional and not required and processed_value is None:
+            continue
+
         field_data = {
             "field_id": field_id,
             "field_name": field_name,
             "type": get_thrift_type_name(field_type, type_args),
-            "required": required,
             "value": processed_value,
             "original_index": index  # For sorting
         }
+
+        # Only show "required": true when fields are actually required
+        if required:
+            field_data["required"] = True
 
         # Add offset information for this field if available
         field_key = f"{nesting_level}_{field_name}_{field_id}"
@@ -499,7 +506,7 @@ def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_fi
     return result_fields
 
 
-def analyze_parquet_file(file_path, debug=False):
+def analyze_parquet_file(file_path, debug=False, show_undefined_optional=False):
     """
     Analyzes a Parquet file and returns a detailed byte-by-byte mapping.
     """
@@ -588,7 +595,8 @@ def analyze_parquet_file(file_path, debug=False):
                     parsed_metadata_fields = thrift_to_dict_with_offsets(
                         file_metadata_obj, 
                         raw_field_details,
-                        metadata_offset
+                        metadata_offset,
+                        show_undefined_optional=show_undefined_optional
                     )
                     
                     # Directly use fields or error info for the segment
@@ -656,9 +664,12 @@ def main():
     parser = argparse.ArgumentParser(description="Parquet Lens: Detailed Parquet file analyzer.")
     parser.add_argument("parquet_file", help="Path to the Parquet file to analyze.")
     parser.add_argument("--debug", action="store_true", help="Enable debug output showing field processing details.")
+    parser.add_argument("--show-undefined-optional-fields", action="store_true", 
+                        help="Show optional fields even when they are undefined/null (default: hide them)")
     args = parser.parse_args()
 
-    analysis_result = analyze_parquet_file(args.parquet_file, debug=args.debug)
+    analysis_result = analyze_parquet_file(args.parquet_file, debug=args.debug, 
+                                         show_undefined_optional=args.show_undefined_optional_fields)
     print(json.dumps(analysis_result, indent=4))
 
 if __name__ == "__main__":
