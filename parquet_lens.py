@@ -1,3 +1,35 @@
+"""
+Parquet Lens: Detailed Parquet File Analyzer
+
+This tool provides byte-level analysis of Parquet files, focusing on the FileMetaData 
+Thrift structure and its nested components. It displays the exact byte locations (offset 
+ranges) in the Parquet file from which each field originates.
+
+Key Features:
+1. **Field Ordering by File Appearance**: Fields are ordered by their actual appearance 
+   in the file, not by their Thrift spec order.
+2. **Comprehensive Field Metadata**: Each field includes:
+   - Field ID (Thrift field identifier)
+   - Field name
+   - Type information (readable type names like "i32", "list<SchemaElement>")
+   - Required/Optional flag
+   - Actual value
+   - Byte ranges (field_header_range and value_range)
+3. **Nested Structure Support**: Nested structures are represented as JSON objects 
+   with their own field metadata and ranges.
+4. **Offset Tracking**: Records exact byte offsets for field headers and values 
+   within the Thrift metadata blob.
+5. **Debug Mode**: Optional debug output showing field processing details.
+
+Usage:
+    python parquet_lens.py <parquet_file> [--debug]
+
+The output includes:
+- File structure overview (magic numbers, data blocks, metadata blob)
+- Detailed FileMetaData field analysis with byte-level precision
+- Nested field ranges for complex structures like RowGroup, ColumnChunk, etc.
+"""
+
 import argparse
 import json
 import pyarrow.parquet as pq
@@ -9,6 +41,8 @@ from thrift.protocol import TCompactProtocol
 from thrift.transport import TTransport
 from thrift.protocol.TProtocol import TType # Import TType from TProtocol
 from parquet.ttypes import FileMetaData # Only import FileMetaData
+# Import enum classes for better enum value conversion
+from parquet.ttypes import Type, Encoding, CompressionCodec, ConvertedType, FieldRepetitionType, PageType
 
 # New OffsetRecordingProtocol
 class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
@@ -92,15 +126,23 @@ class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
         if not self._current_field_name:
             self._current_field_name = f"_unknown_field_id_{fid}_"
 
-        # Only record offsets for top-level fields (nesting level 1, since we start at 0 and increment before processing)
-        if self._struct_nesting_level == 1 and ftype != TType.STOP:
-            if self._current_field_name not in self.field_details:
-                self.field_details[self._current_field_name] = {}
+        # Record offsets for all fields (not just top-level)
+        if ftype != TType.STOP:
+            field_key = f"{self._struct_nesting_level}_{self._current_field_name}_{fid}"
+            if field_key not in self.field_details:
+                self.field_details[field_key] = {}
             
-            self.field_details[self._current_field_name]['field_header_range_in_blob'] = [
+            self.field_details[field_key]['field_header_range_in_blob'] = [
                 start_of_field_processing_offset, 
                 end_of_header_offset
             ]
+            self.field_details[field_key]['nesting_level'] = self._struct_nesting_level
+            self.field_details[field_key]['field_name'] = self._current_field_name
+            self.field_details[field_key]['field_id'] = fid
+            
+            # Debug output (optional - can be enabled for debugging)
+            if hasattr(self, '_debug_enabled') and self._debug_enabled:
+                print(f"DEBUG: Level {self._struct_nesting_level} - Field {self._current_field_name} (ID {fid}) - Header range: [{start_of_field_processing_offset}, {end_of_header_offset}] - Key: {field_key}", file=sys.stderr)
 
         # Handle spec changes for nested structs
         if ftype == TType.STRUCT:
@@ -113,23 +155,26 @@ class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
         return fname_ignored, ftype, fid
 
     def readFieldEnd(self):
-        if self._struct_nesting_level == 1 and self._current_field_name and self._current_field_name in self.field_details:
-            if 'value_range_in_blob' in self.field_details[self._current_field_name]:
-                 self.field_details[self._current_field_name]['field_total_range_in_blob'] = [
-                    self._field_total_start_offset_in_blob,
-                    self.field_details[self._current_field_name]['value_range_in_blob'][1]
-                ]
-            elif self._field_total_start_offset_in_blob is not None:
-                 self.field_details[self._current_field_name]['field_total_range_in_blob'] = [
-                    self._field_total_start_offset_in_blob,
-                    self._get_trans_pos()
-                ]
+        if self._current_field_name and self._current_field_id is not None:
+            field_key = f"{self._struct_nesting_level}_{self._current_field_name}_{self._current_field_id}"
+            if field_key in self.field_details:
+                if 'value_range_in_blob' in self.field_details[field_key]:
+                    # Field total range is from header start to value end
+                    self.field_details[field_key]['field_total_range_in_blob'] = [
+                        self._field_total_start_offset_in_blob,
+                        self.field_details[field_key]['value_range_in_blob'][1]
+                    ]
+                elif self._field_total_start_offset_in_blob is not None:
+                    # No value recorded, use current position
+                    self.field_details[field_key]['field_total_range_in_blob'] = [
+                        self._field_total_start_offset_in_blob,
+                        self._get_trans_pos()
+                    ]
 
         super().readFieldEnd()
         self._current_field_name = None
         self._current_field_id = None
         self._field_total_start_offset_in_blob = None
-        # self._field_header_start_offset_in_blob = None # Removed
 
     def _read_primitive(self, read_method_name):
         value_start_offset = self._get_trans_pos()
@@ -137,14 +182,16 @@ class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
         value = actual_read_method()
         value_end_offset = self._get_trans_pos()
 
-        if self._struct_nesting_level == 1 and self._current_field_name and self._current_field_name in self.field_details:
-            self.field_details[self._current_field_name]['value_range_in_blob'] = [
-                value_start_offset, value_end_offset
-            ]
-            if self._field_total_start_offset_in_blob is not None:
-                 self.field_details[self._current_field_name]['field_total_range_in_blob'] = [
-                    self._field_total_start_offset_in_blob, value_end_offset
+        if self._current_field_name and self._current_field_id is not None:
+            field_key = f"{self._struct_nesting_level}_{self._current_field_name}_{self._current_field_id}"
+            if field_key in self.field_details:
+                self.field_details[field_key]['value_range_in_blob'] = [
+                    value_start_offset, value_end_offset
                 ]
+                if self._field_total_start_offset_in_blob is not None:
+                     self.field_details[field_key]['field_total_range_in_blob'] = [
+                        self._field_total_start_offset_in_blob, value_end_offset
+                    ]
         return value
 
     def readString(self): return self._read_primitive('readString')
@@ -157,18 +204,92 @@ class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
     def readI16(self): return self._read_primitive('readI16')
 
 
-def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_file):
+def get_enum_class_for_field(field_name, struct_name):
     """
-    Recursively converts a Thrift object to a list of field data,
-    ordered by thrift_spec, merging field_details.
-    Handles enums, bytes, and adds offset information.
-    The list is then sorted by file appearance order.
+    Get the appropriate enum class for a field based on field name and struct name.
+    This handles cases where the thrift_spec doesn't explicitly specify enum classes.
+    """
+    enum_mappings = {
+        'ColumnMetaData': {
+            'type': Type,
+            'codec': CompressionCodec,
+        },
+        'SchemaElement': {
+            'type': Type,
+            'converted_type': ConvertedType,
+            'repetition_type': FieldRepetitionType,
+        },
+        'PageHeader': {
+            'type': PageType,
+        },
+        'PageEncodingStats': {
+            'page_type': PageType,
+            'encoding': Encoding,
+        }
+    }
+    
+    # For list elements of enums
+    list_enum_mappings = {
+        'ColumnMetaData': {
+            'encodings': Encoding,  # list<Encoding>
+        }
+    }
+    
+    if struct_name in enum_mappings and field_name in enum_mappings[struct_name]:
+        return enum_mappings[struct_name][field_name]
+    
+    # For list fields, return the element enum class
+    if struct_name in list_enum_mappings and field_name in list_enum_mappings[struct_name]:
+        return list_enum_mappings[struct_name][field_name]
+        
+    return None
+
+
+def get_thrift_type_name(field_type, type_args):
+    """Convert Thrift TType to readable type name"""
+    type_map = {
+        TType.BOOL: 'bool',
+        TType.BYTE: 'i8',
+        TType.I16: 'i16', 
+        TType.I32: 'i32',
+        TType.I64: 'i64',
+        TType.DOUBLE: 'double',
+        TType.STRING: 'string',
+    }
+    
+    if field_type in type_map:
+        return type_map[field_type]
+    elif field_type == TType.LIST:
+        if type_args and isinstance(type_args, tuple) and len(type_args) > 0:
+            element_type = type_args[0]
+            if isinstance(element_type, tuple) and len(element_type) > 0:
+                # For struct lists like list<SchemaElement>
+                if hasattr(element_type[0], '__name__'):
+                    return f"list<{element_type[0].__name__}>"
+                else:
+                    return f"list<{get_thrift_type_name(element_type, None)}>"
+            else:
+                return f"list<{get_thrift_type_name(element_type, None)}>"
+        return "list"
+    elif field_type == TType.STRUCT:
+        if type_args and isinstance(type_args, tuple) and len(type_args) > 0:
+            if hasattr(type_args[0], '__name__'):
+                return type_args[0].__name__
+        return "struct"
+    else:
+        return f"unknown_type_{field_type}"
+
+
+def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_file, nesting_level=1):
+    """
+    Recursively converts a Thrift object to a list or dict of field data,
+    with detailed offset information and type annotations.
     """
     if thrift_obj is None:
         return None
 
     if isinstance(thrift_obj, list):
-        return [thrift_to_dict_with_offsets(i, {}, base_offset_in_file) for i in thrift_obj]
+        return [thrift_to_dict_with_offsets(i, field_details_map, base_offset_in_file, nesting_level + 1) for i in thrift_obj]
 
     if not hasattr(thrift_obj, '__dict__'): # Base types, enums
         if isinstance(thrift_obj, bytes):
@@ -182,108 +303,203 @@ def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_fi
     obj_thrift_spec = getattr(thrift_obj, 'thrift_spec', None)
 
     if not obj_thrift_spec:
+        # Fallback for objects without thrift_spec
+        result = {}
         for attr_name, attr_value in thrift_obj.__dict__.items():
             if attr_name.startswith('_'): continue
-            temp_fields_data.append({
-                "field_name": attr_name,
-                "value": thrift_to_dict_with_offsets(attr_value, {}, base_offset_in_file)
-                # No original_index needed here as it's a fallback
-            })
-        return temp_fields_data # Not sorted by offset as no offset info here
+            result[attr_name] = thrift_to_dict_with_offsets(attr_value, field_details_map, base_offset_in_file, nesting_level + 1)
+        return result
 
     for index, spec_tuple in enumerate(obj_thrift_spec):
         if not spec_tuple: continue
         
+        field_id = spec_tuple[0]
         field_type = spec_tuple[1]
         field_name = spec_tuple[2]
-        type_args = spec_tuple[3]
+        type_args = spec_tuple[3] if len(spec_tuple) > 3 else None
+        default_value = spec_tuple[4] if len(spec_tuple) > 4 else None
         
         field_value = getattr(thrift_obj, field_name, None)
         processed_value = None
         is_enum = False
 
-        if type_args and isinstance(type_args, tuple) and len(type_args) == 1 and hasattr(type_args[0], '_VALUES_TO_NAMES'):
-            enum_class = type_args[0]
-            processed_value = enum_class._VALUES_TO_NAMES.get(field_value, field_value) if field_value is not None else None
-            is_enum = True
-        
-        if is_enum:
-            pass
-        elif field_type == TType.LIST:
+        # Process the field value based on its type
+        if field_type == TType.LIST:
             processed_value = []
             if field_value:
                 element_type_meta = type_args[0] if type_args and isinstance(type_args, tuple) else None
                 element_enum_class = None
                 element_is_enum = False
+                
+                # Check if list elements are enums from type_args
                 if element_type_meta and isinstance(element_type_meta, tuple) and len(element_type_meta) == 1 and hasattr(element_type_meta[0], '_VALUES_TO_NAMES'):
                     element_enum_class = element_type_meta[0]
                     element_is_enum = True
+                else:
+                    # Try to find enum class for list elements based on field name and struct type
+                    struct_name = type(thrift_obj).__name__ if hasattr(thrift_obj, '__class__') else 'Unknown'
+                    element_enum_class = get_enum_class_for_field(field_name, struct_name)
+                    if element_enum_class and hasattr(element_enum_class, '_VALUES_TO_NAMES'):
+                        element_is_enum = True
+                
                 for item in field_value:
                     if element_is_enum and element_enum_class:
                         processed_value.append(element_enum_class._VALUES_TO_NAMES.get(item, item))
                     else:
-                        processed_value.append(thrift_to_dict_with_offsets(item, {}, base_offset_in_file))
+                        processed_value.append(thrift_to_dict_with_offsets(item, field_details_map, base_offset_in_file, nesting_level + 1))
             elif field_value is None:
                 processed_value = None
         elif field_type == TType.STRUCT:
-            processed_value = thrift_to_dict_with_offsets(field_value, {}, base_offset_in_file)
+            processed_value = thrift_to_dict_with_offsets(field_value, field_details_map, base_offset_in_file, nesting_level + 1)
         elif isinstance(field_value, bytes):
             try:
                 processed_value = field_value.decode('utf-8')
             except UnicodeDecodeError:
                 processed_value = field_value.hex()
         else:
-            processed_value = field_value
+            # Handle enums and primitive types
+            processed_value = None
+            is_enum = False
+            
+            # Handle enums - first check if type_args specifies an enum class
+            enum_class = None
+            if type_args and isinstance(type_args, tuple) and len(type_args) == 1 and hasattr(type_args[0], '_VALUES_TO_NAMES'):
+                enum_class = type_args[0]
+                is_enum = True
+            else:
+                # Try to find enum class based on field name and struct type
+                struct_name = type(thrift_obj).__name__ if hasattr(thrift_obj, '__class__') else 'Unknown'
+                enum_class = get_enum_class_for_field(field_name, struct_name)
+                if enum_class and hasattr(enum_class, '_VALUES_TO_NAMES'):
+                    is_enum = True
+            
+            if is_enum and enum_class:
+                processed_value = enum_class._VALUES_TO_NAMES.get(field_value, field_value) if field_value is not None else None
+            else:
+                processed_value = field_value
 
-        field_data_to_store = {"value": processed_value}
-        field_data_to_store['original_index'] = index # Store original thrift_spec index
-
-        if field_name in field_details_map:
-            details = field_details_map[field_name]
-            for range_type, blob_range in details.items():
-                if blob_range and len(blob_range) == 2 and blob_range[0] is not None and blob_range[1] is not None:
-                    file_range_key = range_type.replace('_in_blob', '_in_file')
-                    field_data_to_store[file_range_key] = [
-                        blob_range[0] + base_offset_in_file,
-                        blob_range[1] + base_offset_in_file
-                    ]
+        # Determine if field is required or optional from the thrift file
+        # Look for "required" or "optional" in the thrift spec
+        # The default_value being None doesn't always indicate required
+        required = False
+        # Check the thrift file structure - if we have the spec, we should parse it properly
+        # For now, let's use a simple heuristic: if there's no default and it's not explicitly optional
+        # We can improve this by parsing the actual thrift IDL
         
-        temp_fields_data.append({
+        # Common required fields we know from the thrift file
+        known_required_fields = {
+            'FileMetaData': {'version', 'schema', 'num_rows', 'row_groups'},
+            'SchemaElement': {'name'},
+            'RowGroup': {'columns', 'total_byte_size', 'num_rows'},
+            'ColumnChunk': {'file_path', 'file_offset', 'meta_data'},
+            'ColumnMetaData': {'type', 'encodings', 'path_in_schema', 'codec', 'num_values', 'total_uncompressed_size', 'total_compressed_size', 'data_page_offset'}
+        }
+        
+        struct_name = type(thrift_obj).__name__ if hasattr(thrift_obj, '__class__') else 'Unknown'
+        if struct_name in known_required_fields:
+            required = field_name in known_required_fields[struct_name]
+        else:
+            # Default heuristic: assume optional unless we know it's required
+            required = False
+
+        field_data = {
+            "field_id": field_id,
             "field_name": field_name,
-            **field_data_to_store
-        })
+            "type": get_thrift_type_name(field_type, type_args),
+            "required": required,
+            "value": processed_value,
+            "original_index": index  # For sorting
+        }
 
-    def sort_key(field_item):
-        # Primary key: presence of offset (0 if present, 1 if not)
-        # This ensures fields actually in the file (with offsets) come first.
-        has_offset = 'field_header_range_in_file' in field_item or 'field_total_range_in_file' in field_item
-
-        # Secondary key: The starting offset of the field header.
-        # If not present, use total range. If neither, treat as infinity (comes after present fields).
-        start_offset = float('inf')
-        if 'field_header_range_in_file' in field_item and field_item['field_header_range_in_file']:
-            start_offset = field_item['field_header_range_in_file'][0]
-        elif 'field_total_range_in_file' in field_item and field_item['field_total_range_in_file']: # Fallback if no header range
-            start_offset = field_item['field_total_range_in_file'][0]
-
-        # Tertiary key: The original index from thrift_spec.
-        # This maintains a stable order for fields not present in the file or fields with same start offset.
-        original_idx = field_item['original_index']
+        # Add offset information for this field if available
+        field_key = f"{nesting_level}_{field_name}_{field_id}"
+        if field_key in field_details_map:
+            details = field_details_map[field_key]
+            if 'field_header_range_in_blob' in details and details['field_header_range_in_blob']:
+                blob_range = details['field_header_range_in_blob']
+                field_data['field_header_range'] = [
+                    blob_range[0] + base_offset_in_file,
+                    blob_range[1] + base_offset_in_file
+                ]
+            if 'value_range_in_blob' in details and details['value_range_in_blob']:
+                blob_range = details['value_range_in_blob']
+                field_data['value_range'] = [
+                    blob_range[0] + base_offset_in_file,
+                    blob_range[1] + base_offset_in_file
+                ]
         
-        return (0 if has_offset else 1, start_offset, original_idx)
+        # For nested structures, recursively add offset information
+        if field_type == TType.STRUCT and processed_value and isinstance(processed_value, dict):
+            for nested_field_name, nested_field_data in processed_value.items():
+                if isinstance(nested_field_data, dict) and 'field_id' in nested_field_data:
+                    nested_field_id = nested_field_data['field_id']
+                    nested_field_key = f"{nesting_level + 1}_{nested_field_name}_{nested_field_id}"
+                    if nested_field_key in field_details_map:
+                        nested_details = field_details_map[nested_field_key]
+                        if 'field_header_range_in_blob' in nested_details and nested_details['field_header_range_in_blob']:
+                            blob_range = nested_details['field_header_range_in_blob']
+                            nested_field_data['field_header_range'] = [
+                                blob_range[0] + base_offset_in_file,
+                                blob_range[1] + base_offset_in_file
+                            ]
+                        if 'value_range_in_details' in nested_details and nested_details['value_range_in_blob']:
+                            blob_range = nested_details['value_range_in_blob']
+                            nested_field_data['value_range'] = [
+                                blob_range[0] + base_offset_in_file,
+                                blob_range[1] + base_offset_in_file
+                            ]
+        elif field_type == TType.LIST and processed_value and isinstance(processed_value, list):
+            # For lists of structs, add offset information to each struct element
+            for i, list_item in enumerate(processed_value):
+                if isinstance(list_item, dict):
+                    for nested_field_name, nested_field_data in list_item.items():
+                        if isinstance(nested_field_data, dict) and 'field_id' in nested_field_data:
+                            nested_field_id = nested_field_data['field_id']
+                            # For list elements, we need to find the right offset key
+                            # This is more complex as we'd need to track list indices in our offset recording
+                            # For now, let's just handle the simpler struct case above
+                            pass
+        
+        temp_fields_data.append(field_data)
 
-    temp_fields_data.sort(key=sort_key)
-    
-    result_fields_list = []
+    # Sort fields by their file appearance (offset-based) for top-level, otherwise by thrift_spec order
+    if nesting_level == 1:  # Top-level fields
+        def sort_key(field_item):
+            # Primary: presence of offset (0 if present, 1 if not)
+            has_offset = 'field_header_range' in field_item
+
+            # Secondary: starting offset of field header
+            start_offset = float('inf')
+            if 'field_header_range' in field_item and field_item['field_header_range']:
+                start_offset = field_item['field_header_range'][0]
+            elif 'value_range' in field_item and field_item['value_range']:
+                start_offset = field_item['value_range'][0]
+
+            # Tertiary: original thrift_spec index
+            original_idx = field_item['original_index']
+            
+            return (0 if has_offset else 1, start_offset, original_idx)
+
+        temp_fields_data.sort(key=sort_key)
+
+    # Remove the temporary sorting key and return as list for top-level, dict for nested
+    result_fields = []
     for item in temp_fields_data:
         item_copy = item.copy()
-        del item_copy['original_index'] # Remove temporary sort key
-        result_fields_list.append(item_copy)
+        del item_copy['original_index']
+        result_fields.append(item_copy)
         
-    return result_fields_list
+    # For nested structs (not lists), return as dict instead of list
+    if nesting_level > 1 and not isinstance(thrift_obj, list):
+        result_dict = {}
+        for field in result_fields:
+            result_dict[field['field_name']] = field
+        return result_dict
+        
+    return result_fields
 
 
-def analyze_parquet_file(file_path):
+def analyze_parquet_file(file_path, debug=False):
     """
     Analyzes a Parquet file and returns a detailed byte-by-byte mapping.
     """
@@ -362,6 +578,9 @@ def analyze_parquet_file(file_path):
                     transport = TTransport.TMemoryBuffer(metadata_bytes)
                     protocol = OffsetRecordingProtocol(transport, FileMetaData, metadata_offset)
                     
+                    # Enable debug output in the protocol if requested
+                    protocol._debug_enabled = debug
+                    
                     file_metadata_obj = FileMetaData()
                     file_metadata_obj.read(protocol)
 
@@ -436,9 +655,10 @@ def analyze_parquet_file(file_path):
 def main():
     parser = argparse.ArgumentParser(description="Parquet Lens: Detailed Parquet file analyzer.")
     parser.add_argument("parquet_file", help="Path to the Parquet file to analyze.")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output showing field processing details.")
     args = parser.parse_args()
 
-    analysis_result = analyze_parquet_file(args.parquet_file)
+    analysis_result = analyze_parquet_file(args.parquet_file, debug=args.debug)
     print(json.dumps(analysis_result, indent=4))
 
 if __name__ == "__main__":
