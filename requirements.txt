@@ -1,3 +1,2 @@
-pyarrow
 thrift
-# click # For a nice CLI interface later
+pyarrow

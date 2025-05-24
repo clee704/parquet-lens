@@ -7,37 +7,263 @@ import os # Add os import
 # Imports for Thrift
 from thrift.protocol import TCompactProtocol
 from thrift.transport import TTransport
-from parquet.ttypes import FileMetaData # Updated import path
+from thrift.protocol.TProtocol import TType # Import TType from TProtocol
+from parquet.ttypes import FileMetaData # Only import FileMetaData
 
-def thrift_to_dict(thrift_obj):
-    """
-    Recursively converts a Thrift object to a dictionary.
-    Handles enums by converting them to their string names.
-    Handles bytes by attempting UTF-8 decode or converting to hex.
-    """
-    if hasattr(thrift_obj, '__dict__'):
-        result = {}
-        for k, v in thrift_obj.__dict__.items():
-            if hasattr(v, '_NAMES_TO_VALUES'): # Check if it's a Thrift enum
-                result[k] = thrift_obj._VALUES_TO_NAMES[v] if v in thrift_obj._VALUES_TO_NAMES else v
-            elif isinstance(v, list):
-                result[k] = [thrift_to_dict(i) for i in v]
-            elif hasattr(v, '__dict__'):
-                result[k] = thrift_to_dict(v)
-            elif isinstance(v, bytes): # Handle bytes
-                try:
-                    result[k] = v.decode('utf-8')
-                except UnicodeDecodeError:
-                    result[k] = v.hex() # Fallback to hex representation
+# New OffsetRecordingProtocol
+class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
+    def __init__(self, trans, struct_class, base_offset_in_file): # Changed 'spec' to 'struct_class'
+        super().__init__(trans)
+        self._struct_class_spec = struct_class.thrift_spec if struct_class else None # Use thrift_spec
+        self._base_offset_in_file = base_offset_in_file
+        
+        self.field_details = {}
+        self._current_field_name = None
+        self._current_field_id = None
+        self._field_header_start_offset_in_blob = None
+        self._field_total_start_offset_in_blob = None
+        # For nested structs
+        self._parent_spec_stack = [] 
+        self._current_spec = self._struct_class_spec
+
+    def _get_trans_pos(self):
+        # For TMemoryBuffer, the actual io.BytesIO object is typically in _buffer
+        if isinstance(self.trans, TTransport.TMemoryBuffer):
+            if hasattr(self.trans, '_buffer') and hasattr(self.trans._buffer, 'tell'):
+                return self.trans._buffer.tell()
             else:
-                result[k] = v
-        return result
-    elif isinstance(thrift_obj, bytes): # Handle top-level bytes object, though less common for complex structs
-        try:
-            return thrift_obj.decode('utf-8')
-        except UnicodeDecodeError:
-            return thrift_obj.hex()
-    return thrift_obj
+                # This case implies a non-standard TMemoryBuffer or an unexpected state.
+                raise AttributeError(
+                    f"TMemoryBuffer instance at {id(self.trans)} does not have a usable '_buffer' attribute with a 'tell' method."
+                )
+        # Fallback for other transport types that might have a direct tell() method
+        elif hasattr(self.trans, 'tell'):
+            return self.trans.tell()
+        # If neither, this transport is not supported for position tracking.
+        raise TypeError(
+            f"Unsupported transport for position tracking: {type(self.trans)}. "
+            f"It's not a TMemoryBuffer with a standard '_buffer', nor does it have a 'tell' method."
+        )
+
+    def readStructBegin(self):
+        # For nested structs, we need to push the current spec and update to the new one.
+        # This requires knowing the spec of the field we are about to read.
+        # This part is tricky as readStructBegin itself doesn't know which field it belongs to.
+        # We will handle spec update in readFieldBegin when a TType.STRUCT is encountered.
+        super().readStructBegin()
+
+    def readStructEnd(self):
+        super().readStructEnd()
+        # Pop spec when exiting a struct
+        if self._parent_spec_stack:
+            self._current_spec = self._parent_spec_stack.pop()
+
+    def _get_field_name_from_spec(self, field_id, spec):
+        if not spec: return None
+        for spec_tuple in spec: # Iterate through spec tuples
+            if not spec_tuple: continue # Skip if a tuple is None
+            s_fid, s_ftype, s_fname, s_fargs, s_fdefault = spec_tuple # Unpack
+            if s_fid == field_id:
+                return s_fname
+        return None
+
+    def _get_field_spec_from_id(self, field_id, spec):
+        if not spec: return None
+        for field_spec_tuple in spec:
+            if not field_spec_tuple: continue # Skip if a tuple is None
+            if field_spec_tuple[0] == field_id: # field_spec_tuple[0] is fid
+                return field_spec_tuple
+        return None
+
+    def readFieldBegin(self):
+        self._field_total_start_offset_in_blob = self._get_trans_pos()
+        self._field_header_start_offset_in_blob = self._field_total_start_offset_in_blob
+        
+        fname_ignored, ftype, fid = super().readFieldBegin()
+        
+        self._current_field_id = fid
+        # Use _current_spec which is updated for nested structs
+        self._current_field_name = self._get_field_name_from_spec(fid, self._current_spec)
+        if not self._current_field_name:
+            self._current_field_name = f"_unknown_field_id_{fid}_"
+
+        if self._current_field_name not in self.field_details and ftype != TType.STOP:
+            self.field_details[self._current_field_name] = {}
+        
+        if ftype != TType.STOP:
+            header_end_offset = self._get_trans_pos()
+            self.field_details[self._current_field_name]['field_header_range_in_blob'] = [
+                self._field_header_start_offset_in_blob, header_end_offset
+            ]
+
+        # Handle spec changes for nested structs
+        if ftype == TType.STRUCT:
+            field_spec_tuple = self._get_field_spec_from_id(fid, self._current_spec)
+            if field_spec_tuple and len(field_spec_tuple) > 3 and isinstance(field_spec_tuple[3], tuple) and len(field_spec_tuple[3]) > 0:
+                nested_struct_class = field_spec_tuple[3][0]
+                if hasattr(nested_struct_class, 'thrift_spec'):
+                    self._parent_spec_stack.append(self._current_spec)
+                    self._current_spec = nested_struct_class.thrift_spec
+        return fname_ignored, ftype, fid
+
+    def readFieldEnd(self):
+        if self._current_field_name and self._current_field_name in self.field_details:
+            if 'value_range_in_blob' in self.field_details[self._current_field_name]:
+                 self.field_details[self._current_field_name]['field_total_range_in_blob'] = [
+                    self._field_total_start_offset_in_blob,
+                    self.field_details[self._current_field_name]['value_range_in_blob'][1]
+                ]
+            elif self._field_total_start_offset_in_blob is not None:
+                 self.field_details[self._current_field_name]['field_total_range_in_blob'] = [
+                    self._field_total_start_offset_in_blob,
+                    self._get_trans_pos()
+                ]
+
+        super().readFieldEnd()
+        self._current_field_name = None
+        self._current_field_id = None
+        self._field_total_start_offset_in_blob = None
+        self._field_header_start_offset_in_blob = None
+
+    def _read_primitive(self, read_method_name):
+        value_start_offset = self._get_trans_pos()
+        actual_read_method = getattr(super(), read_method_name)
+        value = actual_read_method()
+        value_end_offset = self._get_trans_pos()
+
+        if self._current_field_name and self._current_field_name in self.field_details:
+            self.field_details[self._current_field_name]['value_range_in_blob'] = [
+                value_start_offset, value_end_offset
+            ]
+            if self._field_total_start_offset_in_blob is not None:
+                 self.field_details[self._current_field_name]['field_total_range_in_blob'] = [
+                    self._field_total_start_offset_in_blob, value_end_offset
+                ]
+        return value
+
+    def readString(self): return self._read_primitive('readString')
+    def readI32(self): return self._read_primitive('readI32')
+    def readI64(self): return self._read_primitive('readI64')
+    def readByte(self): return self._read_primitive('readByte')
+    def readBool(self): return self._read_primitive('readBool')
+    def readDouble(self): return self._read_primitive('readDouble')
+    def readBinary(self): return self._read_primitive('readBinary') # Added for TType.STRING when it's binary
+    def readI16(self): return self._read_primitive('readI16')
+
+
+def thrift_to_dict_with_offsets(thrift_obj, field_details_map, base_offset_in_file):
+    """
+    Recursively converts a Thrift object to a list of field data,
+    ordered by thrift_spec, merging field_details.
+    Handles enums, bytes, and adds offset information.
+    """
+    if thrift_obj is None:
+        return None
+
+    if isinstance(thrift_obj, list):
+        # For lists, each element is processed. The list itself doesn't have 'fields'.
+        # This path is for when a list is passed directly, not as a field of a struct.
+        return [thrift_to_dict_with_offsets(i, {}, base_offset_in_file) for i in thrift_obj]
+
+    if not hasattr(thrift_obj, '__dict__'): # Base types, enums
+        if isinstance(thrift_obj, bytes):
+            try:
+                return thrift_obj.decode('utf-8')
+            except UnicodeDecodeError:
+                return thrift_obj.hex()
+        return thrift_obj
+
+    result_fields_list = []
+    obj_thrift_spec = getattr(thrift_obj, 'thrift_spec', None)
+
+    if not obj_thrift_spec:
+        # Fallback for objects without thrift_spec (should not happen for Thrift-generated classes)
+        # This will return a list of {"field_name": ..., "value": ...} for raw attributes.
+        for attr_name, attr_value in thrift_obj.__dict__.items():
+            if attr_name.startswith('_'): continue
+            result_fields_list.append({
+                "field_name": attr_name,
+                "value": thrift_to_dict_with_offsets(attr_value, {}, base_offset_in_file)
+            })
+        return result_fields_list
+
+    # Iterate through the thrift_spec to ensure all defined fields are considered in order
+    for spec_tuple in obj_thrift_spec:
+        if not spec_tuple: continue
+        # field_id = spec_tuple[0] # Not strictly needed for output, but part of spec
+        field_type = spec_tuple[1]
+        field_name = spec_tuple[2]
+        type_args = spec_tuple[3]
+        # default_value = spec_tuple[4] # Not used here
+
+        field_value = getattr(thrift_obj, field_name, None)
+        
+        # Skip fields that are None and not explicitly set (Thrift optional fields)
+        # However, we want to represent all fields defined in the spec.
+        # If field_value is None, it means it wasn't present in the serialized data or was explicitly null.
+
+        processed_value = None
+        is_enum = False
+        if type_args and isinstance(type_args, tuple) and len(type_args) == 1 and hasattr(type_args[0], '_VALUES_TO_NAMES'):
+            enum_class = type_args[0]
+            if field_value is not None:
+                processed_value = enum_class._VALUES_TO_NAMES.get(field_value, field_value)
+            else:
+                processed_value = None # Explicitly None if field_value is None
+            is_enum = True
+        
+        if is_enum:
+            pass 
+        elif field_type == TType.LIST:
+            processed_value = []
+            if field_value: # If the list field exists and is not None
+                element_type_meta = type_args[0] if type_args and isinstance(type_args, tuple) else None
+                element_is_enum = False
+                element_enum_class = None
+                if element_type_meta and isinstance(element_type_meta, tuple) and len(element_type_meta) == 1 and hasattr(element_type_meta[0], '_VALUES_TO_NAMES'):
+                    element_enum_class = element_type_meta[0]
+                    element_is_enum = True
+
+                for item in field_value:
+                    if element_is_enum and element_enum_class:
+                        processed_value.append(element_enum_class._VALUES_TO_NAMES.get(item, item))
+                    else:
+                        # Recursive call for list elements (e.g., list of structs)
+                        # The result of this will be the direct value or a list of fields if it's a struct
+                        processed_value.append(thrift_to_dict_with_offsets(item, {}, base_offset_in_file))
+            # If field_value is None (optional list not set), processed_value remains None or empty list as initialized
+            elif field_value is None:
+                 processed_value = None
+
+        elif field_type == TType.STRUCT:
+            # Recursive call for nested structs. The result will be a list of fields.
+            processed_value = thrift_to_dict_with_offsets(field_value, {}, base_offset_in_file)
+        elif isinstance(field_value, bytes):
+            try:
+                processed_value = field_value.decode('utf-8')
+            except UnicodeDecodeError:
+                processed_value = field_value.hex()
+        else:
+            processed_value = field_value
+
+        field_data_to_store = {"value": processed_value}
+
+        if field_name in field_details_map:
+            details = field_details_map[field_name]
+            for range_type, blob_range in details.items():
+                if blob_range and len(blob_range) == 2 and blob_range[0] is not None and blob_range[1] is not None:
+                    file_range_key = range_type.replace('_in_blob', '_in_file')
+                    field_data_to_store[file_range_key] = [
+                        blob_range[0] + base_offset_in_file,
+                        blob_range[1] + base_offset_in_file
+                    ]
+        
+        result_fields_list.append({
+            "field_name": field_name,
+            **field_data_to_store
+        })
+    return result_fields_list
+
 
 def analyze_parquet_file(file_path):
     """
@@ -110,25 +336,43 @@ def analyze_parquet_file(file_path):
                 f.seek(metadata_offset)
                 metadata_bytes = f.read(footer_length)
 
-                # Parse metadata_bytes using Thrift
-                parsed_metadata = None
+                # Parse metadata_bytes using Thrift with offset recording
+                parsed_metadata_dict = None
+                raw_field_details = {} # To store details from OffsetRecordingProtocol
+
                 try:
                     transport = TTransport.TMemoryBuffer(metadata_bytes)
-                    protocol = TCompactProtocol.TCompactProtocol(transport)
+                    # Pass the FileMetaData class itself to OffsetRecordingProtocol
+                    protocol = OffsetRecordingProtocol(transport, FileMetaData, metadata_offset)
+                    
                     file_metadata_obj = FileMetaData()
                     file_metadata_obj.read(protocol)
-                    parsed_metadata = thrift_to_dict(file_metadata_obj)
-                except Exception as e:
-                    parsed_metadata = {"error": f"Thrift deserialization failed: {str(e)}"}
 
+                    raw_field_details = protocol.field_details
+                    # The function now returns a list of fields
+                    parsed_metadata_fields = thrift_to_dict_with_offsets(
+                        file_metadata_obj, 
+                        raw_field_details,
+                        metadata_offset
+                    )
+                    # Store as "fields" instead of "parsed_value"
+                    metadata_representation = {"fields": parsed_metadata_fields}
+
+                except Exception as e:
+                    error_details_for_json = {k: str(v) for k, v in raw_field_details.items()}
+                    # Store error under "fields" as well for consistency, or keep "error" at top level of parsed_value
+                    metadata_representation = {
+                        "error": f"Thrift deserialization or offset processing failed: {str(e)}",
+                        "raw_field_details_on_error": error_details_for_json
+                    }
 
                 segments.append({
                     "range": [metadata_offset, metadata_offset + footer_length],
                     "type": "thrift_metadata_blob",
                     "thrift_type": "FileMetaData",
-                    "description": "FileMetaData Thrift structure",
+                    "description": "FileMetaData Thrift structure with field offsets",
                     "size": footer_length,
-                    "parsed_value": parsed_metadata # Add the parsed structure
+                    "parsed_value": metadata_representation # Use the new representation
                 })
 
                 # Placeholder for the data part
