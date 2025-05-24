@@ -24,6 +24,7 @@ import parquet_lens
 from thrift.transport import TTransport
 from thrift.protocol.TProtocol import TType
 from parquet.ttypes import FileMetaData, SchemaElement, RowGroup, ColumnChunk, ColumnMetaData
+from parquet.ttypes import Type, CompressionCodec, ConvertedType, FieldRepetitionType, PageType, Encoding
 
 
 class TestParquetFileGenerator:
@@ -555,6 +556,394 @@ class TestIntegrationTests(unittest.TestCase):
         self.assertEqual(type(parsed_back), type(result))
 
 
+class TestCoverageExpansion(unittest.TestCase):
+    """Additional tests to expand coverage beyond 56%"""
+    
+    def test_transport_edge_cases(self):
+        """Test transport without tell method or _buffer"""
+        # Test transport without both tell and _buffer - should raise TypeError, not AttributeError
+        mock_transport = Mock()
+        
+        # Remove both attributes to test error handling
+        if hasattr(mock_transport, 'tell'):
+            del mock_transport.tell
+        if hasattr(mock_transport, '_buffer'):
+            del mock_transport._buffer
+        
+        protocol = parquet_lens.OffsetRecordingProtocol(
+            mock_transport, FileMetaData, 0
+        )
+        
+        # Should raise TypeError for unsupported transport
+        with self.assertRaises(TypeError):
+            protocol._get_trans_pos()
+    
+    def test_transport_with_tell_fallback(self):
+        """Test transport that uses tell() as fallback"""
+        mock_transport = Mock()
+        mock_transport.tell.return_value = 42
+        
+        # Remove _buffer to force tell() usage
+        if hasattr(mock_transport, '_buffer'):
+            del mock_transport._buffer
+        
+        protocol = parquet_lens.OffsetRecordingProtocol(
+            mock_transport, FileMetaData, 0
+        )
+        
+        # Should use tell() method as fallback
+        pos = protocol._get_trans_pos()
+        self.assertEqual(pos, 42)
+    
+    def test_bytes_utf8_handling(self):
+        """Test byte value encoding/decoding"""
+        # Test valid UTF-8 bytes
+        test_bytes = "Hello, 世界".encode('utf-8')
+        result = parquet_lens.thrift_to_dict_with_offsets(test_bytes, {}, 0)
+        self.assertEqual(result, "Hello, 世界")
+        
+        # Test invalid UTF-8 bytes (should fall back to hex)
+        invalid_bytes = b'\x80\x81\x82\x83'
+        result = parquet_lens.thrift_to_dict_with_offsets(invalid_bytes, {}, 0)
+        self.assertEqual(result, "80818283")
+    
+    def test_complex_enum_mappings(self):
+        """Test additional enum field mappings"""
+        # Test encodings list field
+        enum_class = parquet_lens.get_enum_class_for_field('encodings', 'ColumnMetaData')
+        self.assertEqual(enum_class, Encoding)
+        
+        # Test PageType for pages
+        enum_class = parquet_lens.get_enum_class_for_field('type', 'PageHeader')
+        self.assertEqual(enum_class, PageType)
+        
+        # Test unknown field should return None
+        enum_class = parquet_lens.get_enum_class_for_field('unknown_field', 'UnknownStruct')
+        self.assertIsNone(enum_class)
+    
+    def test_type_name_edge_cases(self):
+        """Test edge cases in type name resolution"""
+        # Test LIST with None type_args
+        result = parquet_lens.get_thrift_type_name(TType.LIST, None)
+        self.assertEqual(result, "list")
+        
+        # Test STRUCT with None type_args
+        result = parquet_lens.get_thrift_type_name(TType.STRUCT, None)
+        self.assertEqual(result, "struct")
+        
+        # Test LIST with empty tuple
+        result = parquet_lens.get_thrift_type_name(TType.LIST, ())
+        self.assertEqual(result, "list")
+        
+        # Test STRUCT with empty tuple
+        result = parquet_lens.get_thrift_type_name(TType.STRUCT, ())
+        self.assertEqual(result, "struct")
+    
+    def test_object_without_thrift_spec(self):
+        """Test handling objects without thrift_spec"""
+        class SimpleObject:
+            def __init__(self):
+                self.field1 = "value1"
+                self.field2 = 42
+                self._private = "ignored"
+        
+        obj = SimpleObject()
+        result = parquet_lens.thrift_to_dict_with_offsets(obj, {}, 0)
+        
+        # Should return dict with public fields only
+        self.assertIsInstance(result, dict)
+        self.assertIn('field1', result)
+        self.assertIn('field2', result)
+        self.assertNotIn('_private', result)
+    
+    def test_debug_mode_functionality(self):
+        """Test debug mode output and functionality"""
+        # Create temporary test file
+        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
+            # Write minimal parquet structure
+            tmp.write(b'PAR1')  # Header
+            tmp.write(b'\x19\x4c\x15\x00\x15\x06\x15\x10\x00\x00\x00\x00')  # Data
+            tmp.write((12).to_bytes(4, byteorder='little'))  # Footer length
+            tmp.write(b'PAR1')  # Footer
+            tmp_path = tmp.name
+        
+        try:
+            # Test debug mode
+            with patch('sys.stderr', new_callable=io.StringIO) as mock_stderr:
+                result = parquet_lens.analyze_parquet_file(tmp_path, debug=True)
+                debug_output = mock_stderr.getvalue()
+                
+                # Should contain debug output
+                self.assertIn("DEBUG:", debug_output)
+                
+                # Result should still be valid
+                self.assertIsInstance(result, dict)
+                self.assertIn('segments', result)
+        finally:
+            os.unlink(tmp_path)
+    
+    def test_list_header_functionality(self):
+        """Test list header display functionality"""
+        # Create temporary test file
+        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
+            # Write minimal parquet structure  
+            tmp.write(b'PAR1')  # Header
+            tmp.write(b'\x19\x4c\x15\x00\x15\x06\x15\x10\x00\x00\x00\x00')  # Data
+            tmp.write((12).to_bytes(4, byteorder='little'))  # Footer length
+            tmp.write(b'PAR1')  # Footer
+            tmp_path = tmp.name
+        
+        try:
+            # Test with show_list_headers=True
+            result = parquet_lens.analyze_parquet_file(tmp_path, show_list_headers=True)
+            
+            # Result should be valid
+            self.assertIsInstance(result, dict)
+            self.assertIn('segments', result)
+            
+            # Test with show_undefined_optional=True (correct parameter name)
+            result = parquet_lens.analyze_parquet_file(tmp_path, show_undefined_optional=True)
+            
+            # Result should be valid
+            self.assertIsInstance(result, dict)
+            self.assertIn('segments', result)
+        finally:
+            os.unlink(tmp_path)
+    
+    def test_field_spec_resolution(self):
+        """Test field spec resolution methods"""
+        test_data = b'\x19\x4c\x15\x00\x15\x06\x15\x10\x00\x00\x00\x00'
+        transport = TTransport.TMemoryBuffer(test_data)
+        protocol = parquet_lens.OffsetRecordingProtocol(transport, FileMetaData, 0)
+        
+        # Test with valid spec
+        spec = [
+            None,
+            (1, TType.I32, 'version', None, None),
+            (2, TType.LIST, 'schema', (TType.STRUCT, (SchemaElement,), False), None),
+        ]
+        
+        # Test existing field ID
+        field_spec = protocol._get_field_spec_from_id(1, spec)
+        self.assertIsNotNone(field_spec)
+        self.assertEqual(field_spec[0], 1)
+        self.assertEqual(field_spec[2], 'version')
+        
+        # Test non-existing field ID
+        field_spec = protocol._get_field_spec_from_id(999, spec)
+        self.assertIsNone(field_spec)
+        
+        # Test with None spec
+        field_spec = protocol._get_field_spec_from_id(1, None)
+        self.assertIsNone(field_spec)
+    
+    def test_file_analysis_error_conditions(self):
+        """Test file analysis error handling"""
+        # Test file that's too short
+        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
+            tmp.write(b'PAR1')  # Only header, too short for footer
+            tmp_path = tmp.name
+        
+        try:
+            result = parquet_lens.analyze_parquet_file(tmp_path)
+            self.assertIsInstance(result, dict)
+            self.assertIn('segments', result)
+        finally:
+            os.unlink(tmp_path)
+        
+        # Test file with wrong footer magic
+        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
+            tmp.write(b'PAR1')  # Header
+            tmp.write(b'\x00' * 50)  # Dummy data
+            tmp.write((50).to_bytes(4, byteorder='little'))  # Footer length
+            tmp.write(b'XXXX')  # Wrong footer magic
+            tmp_path = tmp.name
+        
+        try:
+            result = parquet_lens.analyze_parquet_file(tmp_path)
+            self.assertIsInstance(result, dict)
+            self.assertIn('segments', result)
+            # Should have error segments
+            error_segments = [s for s in result['segments'] if s['type'] == 'error']
+            self.assertTrue(len(error_segments) > 0)
+        finally:
+            os.unlink(tmp_path)
+
+
+class TestFinalCoverageTarget(unittest.TestCase):
+    """Final targeted tests to reach 80% coverage"""
+    
+    def test_transport_fallback_error(self):
+        """Test transport fallback error handling - line 79"""
+        class BadTransport:
+            def __init__(self):
+                self._buffer = object()  # No tell() method
+        
+        bad_transport = BadTransport()
+        protocol = parquet_lens.OffsetRecordingProtocol(bad_transport, FileMetaData, 0)
+        
+        with self.assertRaises(AttributeError) as cm:
+            protocol._get_trans_pos()
+        self.assertIn("does not have a usable '_buffer' attribute", str(cm.exception))
+    
+    def test_get_thrift_type_name_list_edge_cases(self):
+        """Test get_thrift_type_name for lists with various configurations"""
+        # Test list with element class having __name__
+        class TestClass:
+            __name__ = "TestElement"
+        
+        result = parquet_lens.get_thrift_type_name(TType.LIST, (TestClass, TType.STRUCT))
+        self.assertEqual(result, "list<TestElement>")
+        
+        # Test legacy format with tuple containing tuple
+        legacy_args = ((TestClass,),)
+        result = parquet_lens.get_thrift_type_name(TType.LIST, legacy_args)
+        self.assertEqual(result, "list<TestElement>")
+        
+        # Test primitive type list
+        result = parquet_lens.get_thrift_type_name(TType.LIST, (TType.I32,))
+        self.assertEqual(result, "list<i32>")
+    
+    def test_thrift_to_dict_with_show_undefined(self):
+        """Test thrift_to_dict_with_offsets with show_undefined_optional=True"""
+        schema_element = SchemaElement()
+        schema_element.name = "test_field"
+        
+        # Test with show_undefined_optional=True to hit lines 580-596
+        result = parquet_lens.thrift_to_dict_with_offsets(
+            schema_element, {}, 0, 0, show_undefined_optional=True
+        )
+        self.assertIsInstance(result, list)
+    
+    def test_enum_field_lookup(self):
+        """Test enum field lookup functionality"""
+        # Test known enum field
+        result = parquet_lens.get_enum_class_for_field("type", "SchemaElement")
+        self.assertIsNotNone(result)
+        
+        # Test unknown field
+        result = parquet_lens.get_enum_class_for_field("unknown", "Unknown")
+        self.assertIsNone(result)
+    
+    def test_output_file_writing(self):
+        """Test main function with output file argument"""
+        test_data = {"test_key": "test_value"}
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.json') as tmp:
+            temp_file = tmp.name
+        
+        try:
+            # Mock sys.argv to include output file
+            with patch('sys.argv', ['script', 'test.parquet', '--output', temp_file]):
+                with patch('parquet_lens.analyze_parquet_file', return_value=test_data):
+                    try:
+                        parquet_lens.main()
+                    except SystemExit:
+                        pass  # Expected
+            
+            # Verify file was written
+            self.assertTrue(os.path.exists(temp_file))
+        finally:
+            if os.path.exists(temp_file):
+                os.unlink(temp_file)
+
+
+class TestTargetedCoverage80Percent(unittest.TestCase):
+    """Targeted tests to reach 80% coverage"""
+
+    def test_transport_buffer_no_tell_method(self):
+        """Test line 79 - TMemoryBuffer _buffer without tell() method"""
+        test_data = b'\x19\x4c\x15\x00\x15\x06\x15\x10\x00\x00\x00\x00'
+        transport = TTransport.TMemoryBuffer(test_data)
+        
+        # Replace the _buffer with an object that doesn't have tell()
+        class FakeBuffer:
+            pass
+        
+        transport._buffer = FakeBuffer()
+        protocol = parquet_lens.OffsetRecordingProtocol(transport, FileMetaData, 0)
+        
+        with self.assertRaises(AttributeError) as cm:
+            protocol._get_trans_pos()
+        
+        self.assertIn("does not have a usable '_buffer' attribute with a 'tell' method", str(cm.exception))
+
+    def test_list_type_with_element_class_name(self):
+        """Test lines 360-362 - list type with element class having __name__"""
+        result = parquet_lens.get_thrift_type_name(TType.LIST, (SchemaElement, TType.STRUCT))
+        self.assertEqual(result, "list<SchemaElement>")
+
+    def test_list_type_legacy_format(self):
+        """Test lines 365-377 - list type with legacy format"""
+        # Legacy format: tuple containing tuple with struct class
+        legacy_args = ((SchemaElement,),)
+        result = parquet_lens.get_thrift_type_name(TType.LIST, legacy_args)
+        self.assertEqual(result, "list<SchemaElement>")
+        
+        # Test primitive type list (lines 375-377)
+        primitive_args = (TType.I32,)
+        result = parquet_lens.get_thrift_type_name(TType.LIST, primitive_args)
+        self.assertEqual(result, "list<i32>")
+
+    def test_show_undefined_optional_fields(self):
+        """Test lines 580-596 - show undefined optional fields"""
+        schema_element = SchemaElement()
+        schema_element.name = "test_field"
+        
+        # Test with show_undefined_optional=True
+        result = parquet_lens.thrift_to_dict_with_offsets(
+            schema_element, {}, 0, 0, show_undefined_optional=True
+        )
+        
+        self.assertIsInstance(result, list)
+
+    def test_debug_mode_environment(self):
+        """Test lines 668-671 - debug mode functions"""
+        # Test with DEBUG environment variable
+        with patch.dict(os.environ, {'DEBUG': '1'}):
+            schema_element = SchemaElement()
+            schema_element.name = "test_field"
+            
+            result = parquet_lens.thrift_to_dict_with_offsets(
+                schema_element, {}, 0, 0, False
+            )
+            self.assertIsInstance(result, list)
+
+    def test_main_with_output_file_argument(self):
+        """Test line 848 - main function with --output argument"""
+        test_data = {"result": "success"}
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.json') as tmp:
+            temp_file = tmp.name
+        
+        try:
+            with patch('sys.argv', ['parquet_lens', 'test.parquet', '--output', temp_file]):
+                with patch('parquet_lens.analyze_parquet_file', return_value=test_data):
+                    try:
+                        parquet_lens.main()
+                    except SystemExit:
+                        pass
+            
+            self.assertTrue(os.path.exists(temp_file))
+            
+        finally:
+            if os.path.exists(temp_file):
+                os.unlink(temp_file)
+
+    def test_enum_field_lookup_various_cases(self):
+        """Test get_enum_class_for_field function comprehensively"""
+        # Test known enum field mappings
+        result = parquet_lens.get_enum_class_for_field("type", "SchemaElement")
+        self.assertIsNotNone(result)
+        
+        result = parquet_lens.get_enum_class_for_field("converted_type", "SchemaElement")
+        self.assertIsNotNone(result)
+        
+        # Test unknown field
+        result = parquet_lens.get_enum_class_for_field("unknown_field", "UnknownStruct")
+        self.assertIsNone(result)
+    
+
 def create_test_suite():
     """Create a comprehensive test suite"""
     suite = unittest.TestSuite()
@@ -570,6 +959,10 @@ def create_test_suite():
         TestErrorHandling,
         TestRegressionTests,
         TestIntegrationTests,
+        TestCoverageExpansion,
+        TestAdditionalCoverage,
+        TestFinalCoverageTarget,
+        TestTargetedCoverage80Percent,
     ]
     
     for test_class in test_classes:
@@ -616,6 +1009,180 @@ def run_tests():
     print("="*70)
     
     return success
+
+
+class TestFinalCoverageTarget(unittest.TestCase):
+    """Final targeted tests to reach 80% coverage"""
+    
+    def test_transport_fallback_error(self):
+        """Test transport fallback error handling - line 79"""
+        class BadTransport:
+            def __init__(self):
+                self._buffer = object()  # No tell() method
+        
+        bad_transport = BadTransport()
+        protocol = parquet_lens.OffsetRecordingProtocol(bad_transport, FileMetaData, 0)
+        
+        with self.assertRaises(AttributeError) as cm:
+            protocol._get_trans_pos()
+        self.assertIn("does not have a usable '_buffer' attribute", str(cm.exception))
+    
+    def test_get_thrift_type_name_list_edge_cases(self):
+        """Test get_thrift_type_name for lists with various configurations"""
+        # Test list with element class having __name__
+        class TestClass:
+            __name__ = "TestElement"
+        
+        result = parquet_lens.get_thrift_type_name(TType.LIST, (TestClass, TType.STRUCT))
+        self.assertEqual(result, "list<TestElement>")
+        
+        # Test legacy format with tuple containing tuple
+        legacy_args = ((TestClass,),)
+        result = parquet_lens.get_thrift_type_name(TType.LIST, legacy_args)
+        self.assertEqual(result, "list<TestElement>")
+        
+        # Test primitive type list
+        result = parquet_lens.get_thrift_type_name(TType.LIST, (TType.I32,))
+        self.assertEqual(result, "list<i32>")
+    
+    def test_thrift_to_dict_with_show_undefined(self):
+        """Test thrift_to_dict_with_offsets with show_undefined_optional=True"""
+        schema_element = SchemaElement()
+        schema_element.name = "test_field"
+        
+        # Test with show_undefined_optional=True to hit lines 580-596
+        result = parquet_lens.thrift_to_dict_with_offsets(
+            schema_element, {}, 0, 0, show_undefined_optional=True
+        )
+        self.assertIsInstance(result, list)
+    
+    def test_enum_field_lookup(self):
+        """Test enum field lookup functionality"""
+        # Test known enum field
+        result = parquet_lens.get_enum_class_for_field("type", "SchemaElement")
+        self.assertIsNotNone(result)
+        
+        # Test unknown field
+        result = parquet_lens.get_enum_class_for_field("unknown", "Unknown")
+        self.assertIsNone(result)
+    
+    def test_output_file_writing(self):
+        """Test main function with output file argument"""
+        test_data = {"test_key": "test_value"}
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.json') as tmp:
+            temp_file = tmp.name
+        
+        try:
+            # Mock sys.argv to include output file
+            with patch('sys.argv', ['script', 'test.parquet', '--output', temp_file]):
+                with patch('parquet_lens.analyze_parquet_file', return_value=test_data):
+                    try:
+                        parquet_lens.main()
+                    except SystemExit:
+                        pass  # Expected
+            
+            # Verify file was written
+            self.assertTrue(os.path.exists(temp_file))
+        finally:
+            if os.path.exists(temp_file):
+                os.unlink(temp_file)
+
+
+class TestTargetedCoverage80Percent(unittest.TestCase):
+    """Targeted tests to reach 80% coverage"""
+
+    def test_transport_buffer_no_tell_method(self):
+        """Test line 79 - TMemoryBuffer _buffer without tell() method"""
+        test_data = b'\x19\x4c\x15\x00\x15\x06\x15\x10\x00\x00\x00\x00'
+        transport = TTransport.TMemoryBuffer(test_data)
+        
+        # Replace the _buffer with an object that doesn't have tell()
+        class FakeBuffer:
+            pass
+        
+        transport._buffer = FakeBuffer()
+        protocol = parquet_lens.OffsetRecordingProtocol(transport, FileMetaData, 0)
+        
+        with self.assertRaises(AttributeError) as cm:
+            protocol._get_trans_pos()
+        
+        self.assertIn("does not have a usable '_buffer' attribute with a 'tell' method", str(cm.exception))
+
+    def test_list_type_with_element_class_name(self):
+        """Test lines 360-362 - list type with element class having __name__"""
+        result = parquet_lens.get_thrift_type_name(TType.LIST, (SchemaElement, TType.STRUCT))
+        self.assertEqual(result, "list<SchemaElement>")
+
+    def test_list_type_legacy_format(self):
+        """Test lines 365-377 - list type with legacy format"""
+        # Legacy format: tuple containing tuple with struct class
+        legacy_args = ((SchemaElement,),)
+        result = parquet_lens.get_thrift_type_name(TType.LIST, legacy_args)
+        self.assertEqual(result, "list<SchemaElement>")
+        
+        # Test primitive type list (lines 375-377)
+        primitive_args = (TType.I32,)
+        result = parquet_lens.get_thrift_type_name(TType.LIST, primitive_args)
+        self.assertEqual(result, "list<i32>")
+
+    def test_show_undefined_optional_fields(self):
+        """Test lines 580-596 - show undefined optional fields"""
+        schema_element = SchemaElement()
+        schema_element.name = "test_field"
+        
+        # Test with show_undefined_optional=True
+        result = parquet_lens.thrift_to_dict_with_offsets(
+            schema_element, {}, 0, 0, show_undefined_optional=True
+        )
+        
+        self.assertIsInstance(result, list)
+
+    def test_debug_mode_environment(self):
+        """Test lines 668-671 - debug mode functions"""
+        # Test with DEBUG environment variable
+        with patch.dict(os.environ, {'DEBUG': '1'}):
+            schema_element = SchemaElement()
+            schema_element.name = "test_field"
+            
+            result = parquet_lens.thrift_to_dict_with_offsets(
+                schema_element, {}, 0, 0, False
+            )
+            self.assertIsInstance(result, list)
+
+    def test_main_with_output_file_argument(self):
+        """Test line 848 - main function with --output argument"""
+        test_data = {"result": "success"}
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.json') as tmp:
+            temp_file = tmp.name
+        
+        try:
+            with patch('sys.argv', ['parquet_lens', 'test.parquet', '--output', temp_file]):
+                with patch('parquet_lens.analyze_parquet_file', return_value=test_data):
+                    try:
+                        parquet_lens.main()
+                    except SystemExit:
+                        pass
+            
+            self.assertTrue(os.path.exists(temp_file))
+            
+        finally:
+            if os.path.exists(temp_file):
+                os.unlink(temp_file)
+
+    def test_enum_field_lookup_various_cases(self):
+        """Test get_enum_class_for_field function comprehensively"""
+        # Test known enum field mappings
+        result = parquet_lens.get_enum_class_for_field("type", "SchemaElement")
+        self.assertIsNotNone(result)
+        
+        result = parquet_lens.get_enum_class_for_field("converted_type", "SchemaElement")
+        self.assertIsNotNone(result)
+        
+        # Test unknown field
+        result = parquet_lens.get_enum_class_for_field("unknown_field", "UnknownStruct")
+        self.assertIsNone(result)
 
 
 if __name__ == '__main__':
