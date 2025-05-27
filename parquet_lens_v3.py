@@ -3,14 +3,15 @@ import json
 import logging
 import struct
 
-from thrift.protocol import TCompactProtocol
+from thrift.protocol import TProtocol, TCompactProtocol
 from thrift.protocol.TProtocol import TType
-from thrift.transport.TTransport import TMemoryBuffer
+from thrift.transport.TTransport import TTransportBase, TMemoryBuffer
 from parquet.ttypes import (
+    BloomFilterHeader,
     BoundaryOrder,
     ColumnIndex,
-    CompressionCodec,
     ColumnMetaData,
+    CompressionCodec,
     ConvertedType,
     DataPageHeader,
     DataPageHeaderV2,
@@ -20,6 +21,7 @@ from parquet.ttypes import (
     FieldRepetitionType,
     FileMetaData,
     GeographyType,
+    OffsetIndex,
     PageEncodingStats,
     PageHeader,
     PageType,
@@ -28,7 +30,7 @@ from parquet.ttypes import (
 )
 
 
-class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
+class OffsetRecordingProtocol(TProtocol.TProtocolBase):
     logger = logging.getLogger(__qualname__)
 
     type_map = {
@@ -79,7 +81,7 @@ class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
         },
         ColumnIndex: {
             "boundary_order": BoundaryOrder,
-        }
+        },
     }
 
     def __init__(self, trans, name, struct_class):
@@ -242,7 +244,11 @@ class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
         return ret
 
     def _get_pos(self):
-        return self.trans._buffer.tell()
+        if isinstance(self.trans, TMemoryBuffer):
+            return self.trans._buffer.tell()
+        if isinstance(self.trans, TFileTransport):
+            return self.trans.tell()
+        raise RuntimeError(f"unsupported transport: {self.trans}")
 
     def _is_complex_type(self, type_id):
         return type_id in {TType.STRUCT, TType.MAP, TType.SET, TType.LIST}
@@ -296,13 +302,70 @@ class OffsetRecordingProtocol(TCompactProtocol.TCompactProtocol):
         self._current = parent
 
 
-def create_segments_from_offset_info(info, base_offset):
+class OffsetRecordingCompactProtocol(
+    OffsetRecordingProtocol, TCompactProtocol.TCompactProtocol
+):
+    pass
+
+
+class TFileTransport(TTransportBase):
+    """A Thrift transport that reads from a file handle at specific offsets"""
+
+    def __init__(self, file_handle, start_offset=None):
+        self._file = file_handle
+        self._start_offset = start_offset or file_handle.tell()
+        self._current_offset = self._start_offset
+
+    def read(self, sz):
+        self._file.seek(self._current_offset)
+        data = self._file.read(sz)
+        self._current_offset += len(data)
+        return data
+
+    def write(self, buf):
+        raise NotImplementedError("TFileTransport is read-only")
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+    def isOpen(self):
+        return not self._file.closed
+
+    def tell(self):
+        """Return current position relative to start offset"""
+        return self._current_offset - self._start_offset
+
+    def seek(self, offset, whence=0):
+        """Seek relative to start offset"""
+        if whence == 0:  # absolute
+            self._current_offset = self._start_offset + offset
+        elif whence == 1:  # relative
+            self._current_offset += offset
+        elif whence == 2:  # from end - not supported
+            raise NotImplementedError("Seek from end not supported")
+
+
+def create_segment(range_start, range_end, name, value=None, metadata=None):
+    segment = {}
+    segment["offset"] = range_start
+    segment["length"] = range_end - range_start
+    segment["name"] = name
+    segment["value"] = value
+    if metadata:
+        segment["metadata"] = metadata
+    return segment
+
+
+def create_segment_from_offset_info(info, base_offset):
     if not isinstance(info, dict):
         return info
     if info["type"] in ("struct", "list"):
         value = []
         for value_info in info["value"]:
-            value.append(create_segments_from_offset_info(value_info, base_offset))
+            value.append(create_segment_from_offset_info(value_info, base_offset))
     else:
         value = info["value"]
     metadata = {}
@@ -321,17 +384,113 @@ def create_segments_from_offset_info(info, base_offset):
     )
 
 
-def create_segment(range_start, range_end, name, value=None, metadata=None):
-    segment = {}
-    segment["offset_range"] = [range_start, range_end]
-    segment["name"] = name
-    segment["value"] = value
-    if metadata:
-        segment["metadata"] = metadata
+def read_thrift_segment(f, offset, name, thrift_class):
+    f.seek(offset)
+    protocol = OffsetRecordingCompactProtocol(
+        TFileTransport(f),
+        name,
+        struct_class=thrift_class,
+    )
+    obj = thrift_class()
+    obj.read(protocol)
+    segment = create_segment_from_offset_info(protocol.get_info(), base_offset=offset)
+    return obj, segment
+
+
+def read_pages(f, column_chunk, segments):
+    remaining_values = column_chunk.meta_data.num_values
+    offset = column_chunk.meta_data.data_page_offset
+    while remaining_values > 0:
+        page, page_segment = read_thrift_segment(f, offset, "page", PageHeader)
+        page_header_end = page_segment["offset"] + page_segment["length"]
+        segments.append(page_segment)
+        segments.append(
+            create_segment(
+                page_header_end,
+                page_header_end + page.compressed_page_size,
+                "page_data",
+            )
+        )
+        if page.data_page_header is not None:
+            num_values = page.data_page_header.num_values
+        elif page.data_page_header_v2 is not None:
+            num_values = page.data_page_header_v2.num_values
+        else:
+            break
+        remaining_values -= num_values
+        offset = page_header_end + page.compressed_page_size
+
+
+def read_dictionary_page(f, column_chunk, segments):
+    dict_page, dict_page_segment = read_thrift_segment(
+        f,
+        column_chunk.meta_data.dictionary_page_offset,
+        "page",
+        PageHeader,
+    )
+    segments.append(dict_page_segment)
+    segments.append(
+        create_segment(
+            dict_page_segment["offset"] + dict_page_segment["length"],
+            dict_page_segment["offset"]
+            + dict_page_segment["length"]
+            + dict_page.compressed_page_size,
+            "page_data",
+        )
+    )
+
+
+def read_offset_index(f, column_chunk, segments):
+    _, offset_index_segment = read_thrift_segment(
+        f, column_chunk.offset_index_offset, "offset_index", OffsetIndex
+    )
+    segments.append(offset_index_segment)
+
+
+def read_column_index(f, column_chunk, segments):
+    _, column_index_segment = read_thrift_segment(
+        f, column_chunk.column_index_offset, "column_index", ColumnIndex
+    )
+    segments.append(column_index_segment)
+
+
+def read_bloom_filter(f, column_chunk, segments):
+    _, bloom_filter_segment = read_thrift_segment(
+        f, column_chunk.bloom_filter_offset, "bloom_filter", BloomFilterHeader
+    )
+    segments.append(bloom_filter_segment)
+
+
+def fill_gaps(segments, file_size):
+    offset = 0
+    new_segments = []
+    for s in segments:
+        if s["offset"] != offset:
+            new_segments.append(create_segment(offset, s["offset"], "unknown"))
+        new_segments.append(s)
+        offset = s["offset"] + s["length"]
+    if offset != file_size:
+        new_segments.append(create_segment(offset, file_size, "unknown"))
+    return new_segments
+
+
+def segment_to_json(segment):
+    if isinstance(segment, dict):
+        metadata = segment.get("metadata", {})
+        if metadata.get("type") == "struct":
+            return {v["name"]: segment_to_json(v) for v in segment["value"]}
+        if metadata.get("type") == "list":
+            if metadata.get("enum_type") is not None:
+                return metadata["enum_name"]
+            else:
+                return [segment_to_json(v) for v in segment["value"]]
+        if metadata.get("enum_type") is not None:
+            return segment["metadata"]["enum_name"]
+        return segment_to_json(segment["value"])
     return segment
 
 
-def get_segments(file_path):
+def parse_parquet_file(file_path):
     segments = []
 
     with open(file_path, "rb") as f:
@@ -357,29 +516,35 @@ def get_segments(file_path):
             create_segment(file_size - 8, file_size - 4, "footer_length", footer_size)
         )
 
-        # Read footer metadata
-        footer_start = file_size - 8 - footer_size
-        f.seek(footer_start)
-        footer_data = f.read(footer_size)
-
         # Parse footer with offset recording
-        protocol = OffsetRecordingProtocol(
-            TMemoryBuffer(footer_data),
-            "footer",
-            struct_class=FileMetaData,
+        footer_offset = file_size - 8 - footer_size
+        footer, footer_segment = read_thrift_segment(
+            f, footer_offset, "footer", FileMetaData
         )
+        segments.append(footer_segment)
 
-        footer_metadata = FileMetaData()
-        footer_metadata.read(protocol)
+        for row_group in footer.row_groups:
+            for column_chunk in row_group.columns:
+                read_pages(f, column_chunk, segments)
 
-        segments.append(
-            create_segments_from_offset_info(
-                protocol.get_info(), base_offset=footer_start
-            )
-        )
+                if column_chunk.meta_data.dictionary_page_offset is not None:
+                    read_dictionary_page(f, column_chunk, segments)
 
-    segments.sort(key=lambda s: s["offset_range"])
-    return segments
+                if column_chunk.offset_index_offset is not None:
+                    read_offset_index(f, column_chunk, segments)
+
+                if column_chunk.column_index_offset is not None:
+                    read_column_index(f, column_chunk, segments)
+
+                if column_chunk.meta_data.bloom_filter_offset is not None:
+                    read_bloom_filter(f, column_chunk, segments)
+
+    segments.sort(key=lambda s: s["offset"])
+    segments = fill_gaps(segments, file_size)
+    return {
+        "segments": segments,
+        "footer": segment_to_json(footer_segment),
+    }
 
 
 def main():
@@ -394,7 +559,7 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    segments = get_segments(args.parquet_file)
+    segments = parse_parquet_file(args.parquet_file)
     print(json.dumps(segments, indent=2))
 
 
