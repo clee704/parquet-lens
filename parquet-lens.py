@@ -244,6 +244,21 @@ class OffsetRecordingProtocol(TProtocol.TProtocolBase):
         self._append_value(ret)
         return ret
 
+    def readBinary(self):
+        ret = super().readBinary()
+        self.logger.debug(f"readBinary: {ret}")
+        if (
+            self._current["type"] == "string"
+            and self._current["spec"] == "BINARY"
+            or (
+                self._current["type"] == "list"
+                and self._current["spec"][0] == TType.STRING
+                and self._current["spec"][1] == "BINARY"
+            )
+        ):
+            self._append_value(ret)
+        return ret
+
     def _get_pos(self):
         if isinstance(self.trans, TMemoryBuffer):
             return self.trans._buffer.tell()
@@ -685,6 +700,20 @@ def get_pages(segments, column_chunk_data_offsets):
     return column_pages
 
 
+def json_encode(x, truncate_length=32):
+    if isinstance(x, bytes):
+        j = {
+            "type": "binary",
+            "length": len(x),
+        }
+        if len(x) < truncate_length:
+            j["value"] = list(x)
+        else:
+            j["value_truncated"] = list(x[:truncate_length])
+        return j
+    raise ValueError(f"cannot encode for json: {type(x)}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("parquet_file")
@@ -708,7 +737,7 @@ def main():
             "footer": footer,
             "pages": get_pages(segments, column_chunk_data_offsets),
         }
-    print(json.dumps(output, indent=2))
+    print(json.dumps(output, indent=2, default=json_encode))
 
 
 if __name__ == "__main__":
