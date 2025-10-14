@@ -3,6 +3,8 @@ import argparse
 import json
 import logging
 import struct
+import sys
+import traceback
 
 from thrift.protocol import TProtocol, TCompactProtocol
 from thrift.protocol.TProtocol import TType
@@ -130,29 +132,42 @@ class OffsetRecordingProtocol(TProtocol.TProtocolBase):
         return ret
 
     def readFieldBegin(self):
-        assert self._current["type"] == "struct"
+        assert self._current["type"] == "struct", self._current
         ret = super().readFieldBegin()
         self.logger.debug(f"readFieldBegin: {ret} (struct: {self._current['name']})")
         _, type_id, field_id = ret
         if field_id > 0:
             spec = self._current["spec"]
-            field_info = spec[1][field_id]
-            field_id, field_type_id, field_name, field_spec, _ = field_info
-            if field_type_id == TType.STRUCT:
-                type_class = field_spec[0]
-            else:
-                type_class = None
-            self._new_child(
-                {
-                    "name": field_name,
-                    "type": self.type_map[field_type_id],
-                    "type_class": type_class,
-                    "spec": field_spec,
-                    "range_from": self._get_pos(),
-                    "range_to": None,
-                    "value": [] if self._is_complex_type(field_type_id) else None,
-                }
-            )
+            if field_id < len(spec[1]):
+                field_info = spec[1][field_id]
+                field_id, field_type_id, field_name, field_spec, _ = field_info
+                if field_type_id == TType.STRUCT:
+                    type_class = field_spec[0]
+                else:
+                    type_class = None
+                self._new_child(
+                    {
+                        "name": field_name,
+                        "type": self.type_map[field_type_id],
+                        "type_class": type_class,
+                        "spec": field_spec,
+                        "range_from": self._get_pos(),
+                        "range_to": None,
+                        "value": [] if self._is_complex_type(field_type_id) else None,
+                    }
+                )
+            else:  # Malformed file
+                self._new_child(
+                    {
+                        "name": None,
+                        "type": None,
+                        "type_class": None,
+                        "spec": None,
+                        "range_from": self._get_pos(),
+                        "range_to": None,
+                        "value": None,
+                    }
+                )
         return ret
 
     def readFieldEnd(self):
@@ -391,13 +406,20 @@ def create_segment_from_offset_info(info, base_offset):
     if "enum_type" in info:
         metadata["enum_type"] = info["enum_type"]
         metadata["enum_name"] = info["enum_name"]
-    return create_segment(
+    try:
+        range_end = base_offset + info["range_to"]
+    except TypeError:  # Malformed file
+        range_end = float("nan")
+    s = create_segment(
         base_offset + info["range_from"],
-        base_offset + info["range_to"],
+        range_end,
         info["name"],
         value,
         metadata,
     )
+    if range_end == float("nan"):
+        pass
+    return s
 
 
 def read_thrift_segment(f, offset, name, thrift_class):
@@ -408,10 +430,21 @@ def read_thrift_segment(f, offset, name, thrift_class):
         struct_class=thrift_class,
     )
     obj = thrift_class()
-    obj.read(protocol)
+    error = None
+    try:
+        obj.read(protocol)
+    except Exception as e:  # Malformed file
+        print(
+            f"Error occurred while reading {thrift_class} at {offset}: {e}",
+            file=sys.stderr,
+        )
+        traceback.print_exc()
+        error = e
     segment = create_segment_from_offset_info(
         protocol.get_offset_info(), base_offset=offset
     )
+    if error is not None:
+        segment["error"] = error
     return obj, segment
 
 
@@ -421,13 +454,22 @@ def read_pages(f, column_chunk, segments):
     offsets = []
     while remaining_values > 0:
         page, page_segment = read_thrift_segment(f, offset, "page", PageHeader)
+        if page_segment.get("name") != "page":
+            page_segment["$malformed_name"] = page_segment.get("name")
+            page_segment["$malformed_offset"] = page_segment.get("offset")
+            page_segment["name"] = "page"
+            page_segment["offset"] = offset
         page_header_end = page_segment["offset"] + page_segment["length"]
-        offsets.append(page_segment["offset"])
+        offsets.append((page_segment["offset"], page_segment["length"]))
         segments.append(page_segment)
+        try:
+            range_end = page_header_end + page.compressed_page_size
+        except TypeError:  # Malformed file
+            range_end = float("nan")
         segments.append(
             create_segment(
                 page_header_end,
-                page_header_end + page.compressed_page_size,
+                range_end,
                 "page_data",
             )
         )
@@ -436,6 +478,8 @@ def read_pages(f, column_chunk, segments):
         elif page.data_page_header_v2 is not None:
             num_values = page.data_page_header_v2.num_values
         else:
+            break
+        if num_values is None:  # Malformed file
             break
         remaining_values -= num_values
         offset = page_header_end + page.compressed_page_size
@@ -459,7 +503,7 @@ def read_dictionary_page(f, column_chunk, segments):
             "page_data",
         )
     )
-    return dict_page_segment["offset"]
+    return dict_page_segment["offset"], dict_page_segment["length"]
 
 
 def read_column_index(f, column_chunk, segments):
@@ -467,7 +511,7 @@ def read_column_index(f, column_chunk, segments):
         f, column_chunk.column_index_offset, "column_index", ColumnIndex
     )
     segments.append(column_index_segment)
-    return column_index_segment["offset"]
+    return column_index_segment["offset"], column_index_segment["length"]
 
 
 def read_offset_index(f, column_chunk, segments):
@@ -475,7 +519,7 @@ def read_offset_index(f, column_chunk, segments):
         f, column_chunk.offset_index_offset, "offset_index", OffsetIndex
     )
     segments.append(offset_index_segment)
-    return offset_index_segment["offset"]
+    return offset_index_segment["offset"], offset_index_segment["length"]
 
 
 def read_bloom_filter(f, column_chunk, segments):
@@ -483,7 +527,7 @@ def read_bloom_filter(f, column_chunk, segments):
         f, column_chunk.bloom_filter_offset, "bloom_filter", BloomFilterHeader
     )
     segments.append(bloom_filter_segment)
-    return bloom_filter_segment["offset"]
+    return bloom_filter_segment["offset"], bloom_filter_segment["length"]
 
 
 def fill_gaps(segments, file_size):
@@ -570,19 +614,30 @@ def parse_parquet_file(file_path):
 
 
 def segment_to_json(segment):
-    if isinstance(segment, dict):
-        metadata = segment.get("metadata", {})
-        if metadata.get("type") == "struct":
-            return {v["name"]: segment_to_json(v) for v in segment["value"]}
-        if metadata.get("type") == "list":
+    def segment_to_json_impl(segment):
+        if isinstance(segment, dict):
+            metadata = segment.get("metadata", {})
+            if metadata.get("type") == "struct":
+                return {v["name"]: segment_to_json_impl(v) for v in segment["value"]}
+            if metadata.get("type") == "list":
+                if metadata.get("enum_type") is not None:
+                    return metadata["enum_name"]
+                else:
+                    return [segment_to_json_impl(v) for v in segment["value"]]
             if metadata.get("enum_type") is not None:
-                return metadata["enum_name"]
-            else:
-                return [segment_to_json(v) for v in segment["value"]]
-        if metadata.get("enum_type") is not None:
-            return segment["metadata"]["enum_name"]
-        return segment_to_json(segment["value"])
-    return segment
+                return segment["metadata"]["enum_name"]
+            return segment_to_json_impl(segment["value"])
+        return segment
+
+    j = segment_to_json_impl(segment)
+    if "error" in segment:
+        if isinstance(j, dict):
+            j["$error"] = segment["error"]
+            j["$segment"] = segment
+        else:
+            j = {"$error": segment["error"], "$value": j, "$segment": segment}
+
+    return j
 
 
 def find_footer_segment(segments):
@@ -611,16 +666,16 @@ def get_summary(footer, segments):
             num_pages += 1
             page_header_size += s["length"]
             page_json = segment_to_json(s)
-            if page_json["type"] in ("DATA_PAGE", "DATA_PAGE_V2"):
+            if page_json.get("type") in ("DATA_PAGE", "DATA_PAGE_V2"):
                 num_data_pages += 1
-            elif page_json["type"] == "DICTIONARY_PAGE":
+            elif page_json.get("type") == "DICTIONARY_PAGE":
                 num_dict_pages += 1
             if "data_page_header" in page_json:
                 num_v1_data_pages += 1
             if "data_page_header_v2" in page_json:
                 num_v2_data_pages += 1
-            uncompressed_page_data_size += page_json["uncompressed_page_size"]
-            compressed_page_data_size += page_json["compressed_page_size"]
+            uncompressed_page_data_size += page_json.get("uncompressed_page_size", 0)
+            compressed_page_data_size += page_json.get("compressed_page_size", 0)
 
     summary["num_pages"] = num_pages
     summary["num_data_pages"] = num_data_pages
@@ -659,6 +714,10 @@ def get_summary(footer, segments):
         summary["footer_size"] = footer["length"]
     summary["file_size"] = segments[-1]["offset"] + segments[-1]["length"]
 
+    summary["num_malformed_segments"] = sum(
+        1 for s in segments if s.get("error") is not None
+    )
+
     return summary
 
 
@@ -670,8 +729,8 @@ def get_pages(segments, column_chunk_data_offsets):
     column_pages = []
 
     def with_offset(offset):
-        obj = {"$offset": offset}
-        obj.update(page_offset_map[offset])
+        obj = {"$offset": offset[0], "$length": offset[1]}
+        obj.update(page_offset_map.get(offset[0], {"$error": "malformed page"}))
         return obj
 
     for col_idx, (column_path, offsets) in enumerate(column_chunk_data_offsets.items()):
@@ -711,6 +770,10 @@ def json_encode(x, truncate_length=32):
         else:
             j["value_truncated"] = list(x[:truncate_length])
         return j
+    if x == float("nan"):
+        return None
+    if isinstance(x, Exception):
+        return traceback.format_exception(x)
     raise ValueError(f"cannot encode for json: {type(x)}")
 
 
